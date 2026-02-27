@@ -127,8 +127,6 @@ class BottleneckSparseAttention2D(nn.Module):
         super().__init__()
 
         print(f"[BottleneckSparseAttention2D] encoding={encoding}, flash={flash}")
-        if encoding:
-            print(f"   encoding_channels={encoding_channels}, encoding_range={encoding_range}")
 
         # project before attention (sparse 1x1 conv)
         self.pre_proj = SparseConv2d(channels, attn_channels, kernel_size=1)
