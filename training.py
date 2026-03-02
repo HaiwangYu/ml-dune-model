@@ -56,7 +56,7 @@ def test(model, device, test_loader):
 
 
 def main(
-    model_name="attn_base",
+    model_name="attn_default",
     batch_size=100,
     test_batch_size=100,
     epochs=10,
@@ -85,7 +85,7 @@ def main(
     dataset = DUNEImageDataset(rootdir=rootdir, class_names=label_tokens, view_index=2, use_cache=True)
 
     ### for testing: small subset
-    n_subset = 500000
+    n_subset = 10000
     subset_indices = torch.randperm(len(dataset))[:n_subset]
     subset_ds = Subset(dataset, subset_indices)
 
