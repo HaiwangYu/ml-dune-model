@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import warp as wp
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import StepLR
 
 # ── project imports ────────────────────────────────────────────────────────
@@ -193,6 +193,7 @@ def main(
     win_ch          = 10,
     win_tick        = 20,
     n_classes       = 3,
+    subset_frac     = 1.0,     # fraction of each dataset to use, e.g. 0.1 for 10%
     num_workers     = 0,       # set >0 only if warp is initialised in workers
     device          = "cuda",
     metrics_dir     = "./metrics",
@@ -213,6 +214,13 @@ def main(
     sft_dataset = APASparseMetaDataset(
         data_root, apa=apa, view=view, frame_name="frame_rebinned_reco",
     )
+
+    if subset_frac < 1.0:
+        n_ssl_use = max(1, int(len(ssl_dataset) * subset_frac))
+        n_sft_use = max(1, int(len(sft_dataset) * subset_frac))
+        ssl_dataset = Subset(ssl_dataset, torch.randperm(len(ssl_dataset))[:n_ssl_use])
+        sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use])
+        print(f"subset_frac={subset_frac}: using {n_ssl_use} SSL / {n_sft_use} SFT samples")
 
     ssl_loader = DataLoader(
         ssl_dataset, batch_size=batch_size, shuffle=True,
