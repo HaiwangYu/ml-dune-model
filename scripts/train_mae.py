@@ -160,12 +160,15 @@ def _train_epoch(
         model.unfreeze_backbone()
 
         # Progress print every 50 global steps
-        if (step + 1) % 50 == 0:
+        if (step + 1) % 1 == 0:
             ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
             sft_mean = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
+            sft_total   = int(confusion.sum())
+            sft_correct = int(confusion.diagonal().sum())
+            sft_acc_run = 100.0 * sft_correct / sft_total if sft_total > 0 else float("nan")
             print(
                 f"  Epoch {epoch}  step [{step + 1}/{steps_per_epoch}]"
-                f"  SSL={ssl_mean:.4f}  SFT={sft_mean:.4f}"
+                f"  SSL={ssl_mean:.4f}  SFT={sft_mean:.4f}  acc={sft_acc_run:.1f}%"
             )
 
     return ssl_losses, sft_losses, confusion
@@ -180,12 +183,12 @@ def main(
     apa             = 0,
     view            = "W",
     batch_size      = 16,
-    epochs          = 20,
+    epochs          = 2,
     lr              = 1e-3,
     scheduler_step  = 10,
     gamma           = 0.7,
-    n_ssl           = 4,       # SSL batches per interleave cycle
-    n_sft           = 1,       # SFT batches per interleave cycle
+    n_ssl           = 100,       # SSL batches per interleave cycle
+    n_sft           = 100,       # SFT batches per interleave cycle
     masking_frac    = 0.3,
     win_ch          = 10,
     win_tick        = 20,
@@ -239,10 +242,9 @@ def main(
         list(model.backbone.parameters()) + list(model.charge_head.parameters()),
         lr=lr,
     )
-    opt_sft = optim.AdamW(model.nu_flavor_head.parameters(), lr=lr)
-
+    # opt_sft is recreated each epoch (SFT head resets from scratch).
+    # sched_ssl applies to the SSL optimizer across epochs.
     sched_ssl = StepLR(opt_ssl, step_size=scheduler_step, gamma=gamma)
-    sched_sft = StepLR(opt_sft, step_size=scheduler_step, gamma=gamma)
 
     # ── Metrics ───────────────────────────────────────────────────────────
     monitor = MetricsMonitor("sparse_mae", save_dir=metrics_dir)
@@ -260,6 +262,11 @@ def main(
 
     # ── Training loop ─────────────────────────────────────────────────────
     for epoch in range(1, epochs + 1):
+        # Reset SFT head and its optimizer from scratch each epoch so that
+        # the SFT evaluation measures the current backbone features independently.
+        model.reset_sft_head()
+        opt_sft = optim.AdamW(model.nu_flavor_head.parameters(), lr=lr)
+
         monitor.on_epoch_begin(epoch)
 
         ssl_losses, sft_losses, confusion = _train_epoch(
@@ -283,7 +290,6 @@ def main(
         print(f"{'='*60}\n")
 
         sched_ssl.step()
-        sched_sft.step()
 
         # Use SFT mean CE as the "test loss" for MetricsMonitor bookkeeping
         monitor.on_validation_begin(epoch)

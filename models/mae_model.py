@@ -150,3 +150,12 @@ class SparseMAEModel(nn.Module):
     def unfreeze_backbone(self):
         """Re-enable gradient flow through backbone."""
         self.backbone.requires_grad_(True)
+
+    def reset_sft_head(self):
+        """Re-initialize nu_flavor_head to random weights.
+
+        Call at the start of each epoch so every SFT evaluation probes
+        the current backbone features from a clean slate, giving an
+        unbiased measure of feature quality at each SSL checkpoint.
+        """
+        self.nu_flavor_head.reset_parameters()
