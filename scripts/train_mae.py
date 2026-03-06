@@ -163,7 +163,7 @@ def _visualize_ssl(original_vox, masked_vox, pred_vox, epoch: int, viz_dir: Path
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     titles = ["Original (unmasked)", "Masked input", "Reconstructed output"]
     for ax, img, title in zip(axes, [orig_dense, masked_dense, pred_dense], titles):
-        im = ax.imshow(img, aspect="auto", origin="lower", vmin=0.0, vmax=vmax, cmap="viridis")
+        im = ax.imshow(img, aspect="auto", origin="lower", vmin=0.0, vmax=vmax, cmap="cubehelix_r")
         ax.set_title(title)
         ax.set_xlabel("Tick")
         ax.set_ylabel("Channel")
@@ -202,6 +202,8 @@ def _train_ssl_epoch(
             continue
 
         masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
+        if global_step == 0 and epoch == 1:
+            print(f"  [mask] effective masking rate: {mask_bool.float().mean():.1%}")
         pred = model.forward_ssl(masked)
 
         # Capture first valid batch for end-of-epoch visualization.
@@ -310,9 +312,9 @@ def main(
     scheduler_step             = 10,
     gamma                      = 0.7,
     n_sft_epochs_per_ssl_epoch = 3,    # full SFT epochs per SSL epoch
-    masking_frac               = 0.3,
-    win_ch                     = 10,
-    win_tick                   = 20,
+    masking_frac               = 0.01,
+    win_ch                     = 3,
+    win_tick                   = 5,
     n_classes                  = 3,
     ssl_subset_frac            = 1.0,  # fraction of SSL dataset to use
     sft_subset_frac            = 1.0,  # fraction of SFT dataset to use
