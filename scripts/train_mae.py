@@ -79,6 +79,25 @@ from metrics_monitor import MetricsMonitor
 
 
 # ---------------------------------------------------------------------------
+# Focal loss
+# ---------------------------------------------------------------------------
+
+def focal_loss(logits: torch.Tensor, targets: torch.Tensor, gamma: float = 2.0) -> torch.Tensor:
+    """
+    Focal loss for multi-class classification.
+
+    FL(p_t) = -(1 - p_t)^gamma * log(p_t)
+
+    Reduces to cross-entropy when gamma=0.  gamma=2 is a standard default
+    that strongly down-weights easy (high-confidence correct) examples and
+    concentrates training on rare / hard classes such as nueCC.
+    """
+    ce  = F.cross_entropy(logits, targets, reduction="none")   # (N,)
+    pt  = torch.exp(-ce)                                        # confidence on correct class
+    return ((1.0 - pt) ** gamma * ce).mean()
+
+
+# ---------------------------------------------------------------------------
 # Reporting helpers
 # ---------------------------------------------------------------------------
 
@@ -258,6 +277,7 @@ def _train_ssl_epoch(
 def _train_sft_epoch(
     model, sft_loader, opt_sft, opt_ref,
     device, n_classes, epoch, sft_epoch,
+    focal_gamma: float = 2.0,
 ):
     model.freeze_backbone()
     sft_losses, ref_losses = [], []
@@ -276,7 +296,7 @@ def _train_sft_epoch(
 
         # ── SSL feature head ──────────────────────────────────────────────
         logits   = model.forward_sft(vox_sft)
-        sft_loss = F.cross_entropy(logits[valid], labels[valid])
+        sft_loss = focal_loss(logits[valid], labels[valid], gamma=focal_gamma)
         opt_sft.zero_grad()
         sft_loss.backward()
         opt_sft.step()
@@ -288,7 +308,7 @@ def _train_sft_epoch(
 
         # ── Raw-charge reference head ─────────────────────────────────────
         logits_ref = model.forward_sft_ref(vox_sft)
-        ref_loss   = F.cross_entropy(logits_ref[valid], labels[valid])
+        ref_loss   = focal_loss(logits_ref[valid], labels[valid], gamma=focal_gamma)
         opt_ref.zero_grad()
         ref_loss.backward()
         opt_ref.step()
@@ -334,6 +354,7 @@ def main(
     win_ch                     = 3,
     win_tick                   = 5,
     n_classes                  = 3,
+    focal_gamma                = 2.0,  # focal loss gamma; 0 = plain cross-entropy
     ssl_subset_frac            = 1.0,  # fraction of SSL dataset to use
     sft_subset_frac            = 1.0,  # fraction of SFT dataset to use
     num_workers                = 0,    # set >0 only if warp is initialised in workers
@@ -445,6 +466,7 @@ def main(
             sft_losses, conf_sft_ep, ref_losses, conf_ref_ep = _train_sft_epoch(
                 model, sft_loader, opt_sft, opt_ref,
                 device, n_classes, epoch, sft_epoch,
+                focal_gamma=focal_gamma,
             )
             all_sft_losses.extend(sft_losses)
             all_ref_losses.extend(ref_losses)
