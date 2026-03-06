@@ -1,5 +1,5 @@
 """
-train_mae.py — Sparse Masked Auto-Encoder training with interleaved SSL + SFT.
+train_mae.py — Sparse Masked Auto-Encoder training: SSL epochs + SFT epochs.
 
 Architecture
 ------------
@@ -9,8 +9,15 @@ Architecture
 
 Training loop
 -------------
-  Each global step: n_ssl SSL batches (backbone + SSL head updated),
-                    n_sft SFT batches (SFT head only updated, backbone frozen).
+  For each SSL epoch:
+    1. One full pass through ssl_dataset (backbone + SSL head updated).
+    2. n_sft_epochs_per_ssl_epoch full passes through sft_dataset
+       (SFT head only updated, backbone frozen).
+  The SFT head and its optimizer persist across SSL epochs.
+
+  After each SSL epoch a PNG is saved comparing:
+    original (unmasked) | masked input | reconstructed output
+  for the first batch of that epoch.
 
 SFT classes
 -----------
@@ -27,7 +34,6 @@ Usage
 
 import sys
 import math
-import itertools
 from pathlib import Path
 
 import fire
@@ -78,104 +84,196 @@ def _print_class_metrics(cm: torch.Tensor, class_names: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# One epoch of interleaved SSL + SFT
+# SSL Visualization
 # ---------------------------------------------------------------------------
 
-def _train_epoch(
-    model, ssl_iter, sft_iter, opt_ssl, opt_sft,
-    device, n_ssl, n_sft, masking_frac, win_ch, win_tick,
-    n_classes, epoch, steps_per_epoch, monitor,
+def _sparse_to_dense(coords: torch.Tensor, feats: torch.Tensor) -> "np.ndarray | None":
+    """
+    Convert sparse (N, 2) int coords and (N, 1) float feats to a dense 2-D array.
+
+    coords[:, 0] = channel,  coords[:, 1] = tick.
+    Returns float32 numpy array of shape (H, W), or None if empty.
+    """
+    if len(coords) == 0:
+        return None
+    ch = coords[:, 0]
+    tk = coords[:, 1]
+    ch_min, ch_max = int(ch.min()), int(ch.max())
+    tk_min, tk_max = int(tk.min()), int(tk.max())
+    H = ch_max - ch_min + 1
+    W = tk_max - tk_min + 1
+    grid = torch.zeros(H, W)
+    grid[ch - ch_min, tk - tk_min] = feats[:, 0]
+    return grid.numpy()
+
+
+def _visualize_ssl(original_vox, masked_vox, pred_vox, epoch: int, viz_dir: Path) -> None:
+    """
+    Save a 3-panel PNG: original (unmasked) | masked input | reconstructed output.
+
+    Uses the first event in the batch.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("  [viz] matplotlib not available — skipping")
+        return
+
+    offsets = original_vox.offsets
+    if len(offsets) < 2:
+        return
+    end = int(offsets[1].item())
+    if end == 0:
+        return
+
+    # All three share the same coordinate structure (masking/conv preserve coords).
+    coords = original_vox.coordinate_tensor[:end].cpu().int()
+    orig_dense   = _sparse_to_dense(coords, original_vox.feature_tensor[:end].cpu())
+    masked_dense = _sparse_to_dense(coords, masked_vox.feature_tensor[:end].cpu())
+    pred_dense   = _sparse_to_dense(coords, pred_vox.feature_tensor[:end].cpu())
+
+    if orig_dense is None:
+        return
+
+    vmax = float(orig_dense.max()) or 1.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    titles = ["Original (unmasked)", "Masked input", "Reconstructed output"]
+    for ax, img, title in zip(axes, [orig_dense, masked_dense, pred_dense], titles):
+        im = ax.imshow(img, aspect="auto", origin="lower", vmin=0.0, vmax=vmax, cmap="viridis")
+        ax.set_title(title)
+        ax.set_xlabel("Tick")
+        ax.set_ylabel("Channel")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(f"SSL Reconstruction — Epoch {epoch}", fontsize=13)
+    plt.tight_layout()
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    out_path = viz_dir / f"ssl_viz_epoch{epoch:04d}.png"
+    plt.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"  [viz] Saved: {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# One SSL epoch
+# ---------------------------------------------------------------------------
+
+def _train_ssl_epoch(
+    model, ssl_loader, opt_ssl,
+    device, masking_frac, win_ch, win_tick,
+    epoch, monitor, viz_dir: Path,
 ):
     model.train()
+    ssl_losses = []
+    # Store raw CPU batch from first step for visualization (no gradient risk).
+    viz_vox_cpu = None
 
-    ssl_losses  = []
-    sft_losses  = []
-    confusion   = torch.zeros(n_classes, n_classes, dtype=torch.long)
-    global_step = 0
+    for global_step, vox_cpu in enumerate(ssl_loader):
+        vox = voxels_to_device(vox_cpu, device)
 
-    for step in range(steps_per_epoch):
+        monitor.on_batch_begin()
 
-        # ── SSL phase ──────────────────────────────────────────────────────
-        for k in range(n_ssl):
-            vox = voxels_to_device(next(ssl_iter), device)
+        if vox.feature_tensor.shape[0] == 0:
+            monitor.on_batch_end(global_step, 0.0, 0)
+            continue
 
-            monitor.on_batch_begin()
+        masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
+        pred = model.forward_ssl(masked)
 
-            # Skip batches where every event has 0 active voxels —
-            # WarpConvNet's kernel map builder crashes on empty coordinate tensors.
-            if vox.feature_tensor.shape[0] == 0:
-                monitor.on_batch_end(global_step, 0.0, 0)
-                global_step += 1
-                continue
+        # Capture first valid batch for end-of-epoch visualization.
+        if viz_vox_cpu is None:
+            viz_vox_cpu = vox_cpu
 
-            masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
+        if mask_bool.any():
+            loss = F.l1_loss(
+                pred.feature_tensor[mask_bool],
+                vox.feature_tensor[mask_bool],
+            )
+            opt_ssl.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.backbone.parameters()) + list(model.charge_head.parameters()),
+                max_norm=1.0,
+            )
+            opt_ssl.step()
+            ssl_losses.append(loss.item())
+            monitor.on_batch_end(global_step, loss.item(), int(mask_bool.sum()))
+        else:
+            monitor.on_batch_end(global_step, 0.0, 0)
 
-            pred  = model.forward_ssl(masked)
-
-            # L1 loss over masked voxels only
-            if mask_bool.any():
-                loss = F.l1_loss(
-                    pred.feature_tensor[mask_bool],
-                    vox.feature_tensor[mask_bool],
-                )
-                opt_ssl.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.backbone.parameters()) + list(model.charge_head.parameters()),
-                    max_norm=1.0,
-                )
-                opt_ssl.step()
-                ssl_losses.append(loss.item())
-                monitor.on_batch_end(global_step, loss.item(), int(mask_bool.sum()))
-            else:
-                monitor.on_batch_end(global_step, 0.0, 0)
-
-            global_step += 1
-
-        # ── SFT phase ──────────────────────────────────────────────────────
-        model.freeze_backbone()
-        for _ in range(n_sft):
-            vox_sft, labels = next(sft_iter)
-            vox_sft = voxels_to_device(vox_sft, device)
-            labels  = labels.to(device)
-
-            valid = labels >= 0
-            if not valid.any():
-                continue
-
-            # Skip if no active voxels across the whole batch
-            if vox_sft.feature_tensor.shape[0] == 0:
-                continue
-
-            logits   = model.forward_sft(vox_sft)          # [B, n_classes]
-            sft_loss = F.cross_entropy(logits[valid], labels[valid])
-            opt_sft.zero_grad()
-            sft_loss.backward()
-            opt_sft.step()
-            sft_losses.append(sft_loss.item())
-
-            # Accumulate confusion matrix
-            preds = logits[valid].argmax(dim=1).cpu()
-            trues = labels[valid].cpu()
-            for t, p in zip(trues.tolist(), preds.tolist()):
-                if 0 <= t < n_classes and 0 <= p < n_classes:
-                    confusion[t, p] += 1
-
-        model.unfreeze_backbone()
-
-        # Progress print every 50 global steps
-        if (step + 1) % 1 == 0:
+        if (global_step + 1) % 50 == 0:
             ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
-            sft_mean = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
-            sft_total   = int(confusion.sum())
-            sft_correct = int(confusion.diagonal().sum())
-            sft_acc_run = 100.0 * sft_correct / sft_total if sft_total > 0 else float("nan")
             print(
-                f"  Epoch {epoch}  step [{step + 1}/{steps_per_epoch}]"
-                f"  SSL={ssl_mean:.4f}  SFT={sft_mean:.4f}  acc={sft_acc_run:.1f}%"
+                f"  [SSL] Epoch {epoch}  step [{global_step + 1}/{len(ssl_loader)}]"
+                f"  loss={ssl_mean:.4f}"
             )
 
-    return ssl_losses, sft_losses, confusion
+    # ── Visualization (end-of-epoch, model eval, no grad) ─────────────────
+    if viz_vox_cpu is not None:
+        model.eval()
+        with torch.no_grad():
+            vox_viz   = voxels_to_device(viz_vox_cpu, device)
+            if vox_viz.feature_tensor.shape[0] > 0:
+                masked_viz, _ = sparse_block_mask(vox_viz, masking_frac, win_ch, win_tick)
+                pred_viz      = model.forward_ssl(masked_viz)
+                _visualize_ssl(vox_viz, masked_viz, pred_viz, epoch, viz_dir)
+        model.train()
+
+    return ssl_losses
+
+
+# ---------------------------------------------------------------------------
+# One SFT epoch
+# ---------------------------------------------------------------------------
+
+def _train_sft_epoch(
+    model, sft_loader, opt_sft,
+    device, n_classes, epoch, sft_epoch,
+):
+    model.freeze_backbone()
+    sft_losses = []
+    confusion  = torch.zeros(n_classes, n_classes, dtype=torch.long)
+
+    for step, (vox_sft_cpu, labels) in enumerate(sft_loader):
+        vox_sft = voxels_to_device(vox_sft_cpu, device)
+        labels  = labels.to(device)
+
+        valid = labels >= 0
+        if not valid.any():
+            continue
+        if vox_sft.feature_tensor.shape[0] == 0:
+            continue
+
+        logits   = model.forward_sft(vox_sft)
+        sft_loss = F.cross_entropy(logits[valid], labels[valid])
+        opt_sft.zero_grad()
+        sft_loss.backward()
+        opt_sft.step()
+        sft_losses.append(sft_loss.item())
+
+        preds = logits[valid].argmax(dim=1).cpu()
+        trues = labels[valid].cpu()
+        for t, p in zip(trues.tolist(), preds.tolist()):
+            if 0 <= t < n_classes and 0 <= p < n_classes:
+                confusion[t, p] += 1
+
+        if (step + 1) % 50 == 0:
+            sft_mean = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
+            total    = int(confusion.sum())
+            correct  = int(confusion.diagonal().sum())
+            acc      = 100.0 * correct / total if total > 0 else float("nan")
+            print(
+                f"  [SFT] SSL-epoch {epoch}  SFT-epoch {sft_epoch}"
+                f"  step [{step + 1}/{len(sft_loader)}]"
+                f"  loss={sft_mean:.4f}  acc={acc:.1f}%"
+            )
+
+    model.unfreeze_backbone()
+    return sft_losses, confusion
 
 
 # ---------------------------------------------------------------------------
@@ -183,28 +281,29 @@ def _train_epoch(
 # ---------------------------------------------------------------------------
 
 def main(
-    data_root       = "/nfs/data/1/yuhw/cffm-data/prod-jay-1M-2026-02-27",
-    apa             = 0,
-    view            = "W",
-    batch_size      = 16,
-    epochs          = 2,
-    lr              = 1e-3,
-    scheduler_step  = 10,
-    gamma           = 0.7,
-    n_ssl           = 100,       # SSL batches per interleave cycle
-    n_sft           = 100,       # SFT batches per interleave cycle
-    masking_frac    = 0.3,
-    win_ch          = 10,
-    win_tick        = 20,
-    n_classes       = 3,
-    subset_frac     = 1.0,     # fraction of each dataset to use, e.g. 0.1 for 10%
-    num_workers     = 0,       # set >0 only if warp is initialised in workers
-    device          = "cuda",
-    metrics_dir     = "./metrics",
-    checkpoints_dir = "./checkpoints",
-    save_every      = 5,
+    data_root                  = "/nfs/data/1/yuhw/cffm-data/prod-jay-1M-2026-02-27",
+    apa                        = 0,
+    view                       = "W",
+    batch_size                 = 16,
+    epochs                     = 2,
+    lr                         = 1e-3,
+    scheduler_step             = 10,
+    gamma                      = 0.7,
+    n_sft_epochs_per_ssl_epoch = 3,    # full SFT epochs per SSL epoch
+    masking_frac               = 0.3,
+    win_ch                     = 10,
+    win_tick                   = 20,
+    n_classes                  = 3,
+    ssl_subset_frac            = 1.0,  # fraction of SSL dataset to use
+    sft_subset_frac            = 1.0,  # fraction of SFT dataset to use
+    num_workers                = 0,    # set >0 only if warp is initialised in workers
+    device                     = "cuda",
+    metrics_dir                = "./metrics",
+    checkpoints_dir            = "./checkpoints",
+    save_every                 = 5,
+    viz_dir                    = "./viz",
 ):
-    """Sparse MAE training: interleaved SSL (charge reconstruction) + SFT (nu flavour)."""
+    """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
     wp.init()
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
@@ -219,12 +318,15 @@ def main(
         data_root, apa=apa, view=view, frame_name="frame_rebinned_reco",
     )
 
-    if subset_frac < 1.0:
-        n_ssl_use = max(1, int(len(ssl_dataset) * subset_frac))
-        n_sft_use = max(1, int(len(sft_dataset) * subset_frac))
+    if ssl_subset_frac < 1.0:
+        n_ssl_use   = max(1, int(len(ssl_dataset) * ssl_subset_frac))
         ssl_dataset = Subset(ssl_dataset, torch.randperm(len(ssl_dataset))[:n_ssl_use])
+        print(f"ssl_subset_frac={ssl_subset_frac}: using {n_ssl_use} SSL samples")
+
+    if sft_subset_frac < 1.0:
+        n_sft_use   = max(1, int(len(sft_dataset) * sft_subset_frac))
         sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use])
-        print(f"subset_frac={subset_frac}: using {n_ssl_use} SSL / {n_sft_use} SFT samples")
+        print(f"sft_subset_frac={sft_subset_frac}: using {n_sft_use} SFT samples")
 
     ssl_loader = DataLoader(
         ssl_dataset, batch_size=batch_size, shuffle=True,
@@ -235,27 +337,18 @@ def main(
         collate_fn=voxels_label_collate_fn, num_workers=num_workers,
     )
 
-    ssl_iter = itertools.cycle(ssl_loader)
-    sft_iter = itertools.cycle(sft_loader)
-
-    # Steps per epoch = full pass through SSL data, grouped into cycles of n_ssl
-    steps_per_epoch = max(1, len(ssl_loader) // n_ssl)
-    print(f"SSL dataset: {len(ssl_dataset)} samples  |  "
-          f"SFT dataset: {len(sft_dataset)} samples")
-    print(f"Steps per epoch: {steps_per_epoch}  "
-          f"(n_ssl={n_ssl}, n_sft={n_sft})")
+    print(f"SSL dataset: {len(ssl_dataset)} samples  |  SFT dataset: {len(sft_dataset)} samples")
+    print(f"n_sft_epochs_per_ssl_epoch={n_sft_epochs_per_ssl_epoch}")
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = SparseMAEModel(n_classes=n_classes).to(device)
 
     # ── Optimizers ────────────────────────────────────────────────────────
-    # opt_ssl updates backbone + charge_head; opt_sft updates only SFT head.
     opt_ssl = optim.AdamW(
         list(model.backbone.parameters()) + list(model.charge_head.parameters()),
         lr=lr,
     )
-    # opt_sft is recreated each epoch (SFT head resets from scratch).
-    # sched_ssl applies to the SSL optimizer across epochs.
+    opt_sft = optim.AdamW(model.nu_flavor_head.parameters(), lr=lr)
     sched_ssl = StepLR(opt_ssl, step_size=scheduler_step, gamma=gamma)
 
     # ── Metrics ───────────────────────────────────────────────────────────
@@ -271,28 +364,50 @@ def main(
 
     checkpoints_dir = Path(checkpoints_dir)
     checkpoints_dir.mkdir(exist_ok=True)
+    viz_dir = Path(viz_dir)
 
     # ── Training loop ─────────────────────────────────────────────────────
     for epoch in range(1, epochs + 1):
-        # Reset SFT head and its optimizer from scratch each epoch so that
-        # the SFT evaluation measures the current backbone features independently.
-        model.reset_sft_head()
-        opt_sft = optim.AdamW(model.nu_flavor_head.parameters(), lr=lr)
+        print(f"\n{'='*60}")
+        print(f"SSL Epoch {epoch}/{epochs}")
 
         monitor.on_epoch_begin(epoch)
 
-        ssl_losses, sft_losses, confusion = _train_epoch(
-            model, ssl_iter, sft_iter, opt_ssl, opt_sft,
-            device, n_ssl, n_sft, masking_frac, win_ch, win_tick,
-            n_classes, epoch, steps_per_epoch, monitor,
+        # ── SSL epoch ─────────────────────────────────────────────────────
+        ssl_losses = _train_ssl_epoch(
+            model, ssl_loader, opt_ssl,
+            device, masking_frac, win_ch, win_tick,
+            epoch, monitor, viz_dir,
         )
-
         ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
-        sft_mean = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
+        print(f"  SSL epoch {epoch} done  |  mean L1={ssl_mean:.4f}")
+        sched_ssl.step()
 
-        total_sft = int(confusion.sum())
+        # ── SFT epochs ────────────────────────────────────────────────────
+        all_sft_losses = []
+        confusion      = torch.zeros(n_classes, n_classes, dtype=torch.long)
+
+        for sft_epoch in range(1, n_sft_epochs_per_ssl_epoch + 1):
+            sft_losses, conf_ep = _train_sft_epoch(
+                model, sft_loader, opt_sft,
+                device, n_classes, epoch, sft_epoch,
+            )
+            all_sft_losses.extend(sft_losses)
+            confusion += conf_ep
+
+            sft_mean_ep = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
+            total_ep    = int(conf_ep.sum())
+            correct_ep  = int(conf_ep.diagonal().sum())
+            acc_ep      = 100.0 * correct_ep / total_ep if total_ep > 0 else float("nan")
+            print(
+                f"  SFT epoch {sft_epoch}/{n_sft_epochs_per_ssl_epoch}"
+                f"  |  CE={sft_mean_ep:.4f}  |  acc={acc_ep:.1f}%"
+            )
+
+        sft_mean    = sum(all_sft_losses) / len(all_sft_losses) if all_sft_losses else float("nan")
+        total_sft   = int(confusion.sum())
         sft_correct = int(confusion.diagonal().sum())
-        sft_acc = 100.0 * sft_correct / total_sft if total_sft > 0 else 0.0
+        sft_acc     = 100.0 * sft_correct / total_sft if total_sft > 0 else 0.0
 
         print(f"\n{'='*60}")
         print(f"Epoch {epoch:3d}  |  SSL L1={ssl_mean:.4f}  |  "
@@ -301,9 +416,6 @@ def main(
         _print_class_metrics(confusion, CLASS_NAMES)
         print(f"{'='*60}\n")
 
-        sched_ssl.step()
-
-        # Use SFT mean CE as the "test loss" for MetricsMonitor bookkeeping
         monitor.on_validation_begin(epoch)
         monitor.on_validation_end()
         monitor.on_epoch_end(epoch, sft_mean if not math.isnan(sft_mean) else 0.0, sft_acc)
