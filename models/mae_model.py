@@ -79,6 +79,25 @@ def _replace_features(vox: Voxels, new_feats: Tensor) -> Voxels:
 
 
 # ---------------------------------------------------------------------------
+# Charge normalization helpers
+# ---------------------------------------------------------------------------
+
+def log1p_voxels(vox: Voxels) -> Voxels:
+    """Apply log1p to all feature values.  Maps raw ADC → log(ADC+1).
+
+    Compresses the ~350× ADC dynamic range to ~10×, making reconstruction
+    targets uniform across the charge spectrum.  Pair with expm1_voxels to
+    recover raw ADC for visualization or downstream use.
+    """
+    return _replace_features(vox, torch.log1p(vox.feature_tensor))
+
+
+def expm1_voxels(vox: Voxels) -> Voxels:
+    """Apply expm1 to all feature values.  Inverts log1p_voxels: log(ADC+1) → ADC."""
+    return _replace_features(vox, torch.expm1(vox.feature_tensor))
+
+
+# ---------------------------------------------------------------------------
 # Sparse CNN classification head
 # ---------------------------------------------------------------------------
 

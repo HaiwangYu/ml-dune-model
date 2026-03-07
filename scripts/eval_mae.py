@@ -33,7 +33,7 @@ from warpconvnet.geometry.features.cat import CatFeatures
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.mae_model import SparseMAEModel, voxels_to_device
+from models.mae_model import SparseMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
 from models.sparse_masking import sparse_block_mask
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset, CLASS_NAMES
 from loader.collate import voxels_label_collate_fn
@@ -186,12 +186,14 @@ def _module_ssl(model, dataset, device, cfg: dict) -> None:
 
     with torch.no_grad():
         for batch_idx, (vox_cpu, _labels) in enumerate(loader):
-            vox = voxels_to_device(vox_cpu, device)
-            if vox.feature_tensor.shape[0] == 0:
+            vox_raw = voxels_to_device(vox_cpu, device)
+            if vox_raw.feature_tensor.shape[0] == 0:
                 continue
 
+            # Normalize to log space — must match training preprocessing.
+            vox    = log1p_voxels(vox_raw)
             masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
-            pred = model.forward_ssl(masked)
+            pred   = model.forward_ssl(masked)
 
             n_input  = vox.feature_tensor.shape[0]
             n_masked = int(mask_bool.sum())
@@ -215,15 +217,15 @@ def _module_ssl(model, dataset, device, cfg: dict) -> None:
                       f"  [{mask_pct:.1f}% of input]")
                 print(f"    output voxels : {n_output:>8d}  ({n_output/B:>7.1f} avg/event)")
 
-            # Per-event visualization
+            # Per-event visualization — convert back to raw ADC for display.
             for evt in range(B):
                 if n_viz_done >= n_viz:
                     break
                 if int(vox.offsets[evt + 1].item()) - int(vox.offsets[evt].item()) == 0:
                     continue
-                orig_evt   = _slice_single_event(vox,    evt)
-                masked_evt = _slice_single_event(masked, evt)
-                pred_evt   = _slice_single_event(pred,   evt)
+                orig_evt   = expm1_voxels(_slice_single_event(vox_raw, evt))
+                masked_evt = expm1_voxels(_slice_single_event(masked,  evt))
+                pred_evt   = expm1_voxels(_slice_single_event(pred,    evt))
                 event_id   = batch_idx * batch_size + evt
                 _visualize_event(orig_evt, masked_evt, pred_evt, event_id,
                                  viz_dir / f"eval_ssl_event{event_id:04d}.png")
@@ -231,7 +233,7 @@ def _module_ssl(model, dataset, device, cfg: dict) -> None:
 
     mean_l1 = sum(l1_losses) / len(l1_losses) if l1_losses else float("nan")
     print(f"\n  Evaluated {n_events} events")
-    print(f"  Mean L1 loss (masked voxels): {mean_l1:.6f}")
+    print(f"  Mean L1 loss (masked voxels, log1p space): {mean_l1:.6f}")
     print(f"{'='*60}")
 
 
@@ -258,7 +260,7 @@ def _module_sft(model, dataset, device, cfg: dict) -> None:
 
     with torch.no_grad():
         for vox_cpu, labels in loader:
-            vox    = voxels_to_device(vox_cpu, device)
+            vox    = log1p_voxels(voxels_to_device(vox_cpu, device))
             labels = labels.to(device)
 
             valid = labels >= 0

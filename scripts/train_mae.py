@@ -70,7 +70,7 @@ def _least_occupied_cuda_device() -> torch.device:
 # ── project imports ────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.mae_model import SparseMAEModel, voxels_to_device
+from models.mae_model import SparseMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
 from models.sparse_masking import sparse_block_mask
 from loader.apa_sparse_dataset import APASparseDataset
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset, CLASS_NAMES
@@ -215,7 +215,12 @@ def _train_ssl_epoch(
     viz_vox_cpu = None
 
     for global_step, vox_cpu in enumerate(ssl_loader):
-        vox = voxels_to_device(vox_cpu, device)
+        # Capture first valid raw CPU batch for end-of-epoch visualization.
+        if viz_vox_cpu is None and vox_cpu is not None:
+            viz_vox_cpu = vox_cpu
+
+        # Normalize charge: log(ADC+1) compresses 350× dynamic range to ~10×.
+        vox = log1p_voxels(voxels_to_device(vox_cpu, device))
 
         monitor.on_batch_begin()
 
@@ -228,15 +233,16 @@ def _train_ssl_epoch(
             print(f"  [mask] effective masking rate: {mask_bool.float().mean():.1%}")
         pred = model.forward_ssl(masked)
 
-        # Capture first valid batch for end-of-epoch visualization.
-        if viz_vox_cpu is None:
-            viz_vox_cpu = vox_cpu
-
         if mask_bool.any():
-            loss = F.l1_loss(
-                pred.feature_tensor[mask_bool],
-                vox.feature_tensor[mask_bool],
-            )
+            # Loss on ALL active voxels; masked positions upweighted so their
+            # total contribution equals that of unmasked positions.
+            n_total  = pred.feature_tensor.shape[0]
+            n_masked = int(mask_bool.sum())
+            per_voxel = F.l1_loss(pred.feature_tensor, vox.feature_tensor,
+                                   reduction="none")[:, 0]   # [N]
+            weights = torch.ones(n_total, device=device, dtype=per_voxel.dtype)
+            weights[mask_bool] = n_total / n_masked
+            loss = (per_voxel * weights).mean()
             opt_ssl.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -245,7 +251,7 @@ def _train_ssl_epoch(
             )
             opt_ssl.step()
             ssl_losses.append(loss.item())
-            monitor.on_batch_end(global_step, loss.item(), int(mask_bool.sum()))
+            monitor.on_batch_end(global_step, loss.item(), n_masked)
         else:
             monitor.on_batch_end(global_step, 0.0, 0)
 
@@ -260,11 +266,15 @@ def _train_ssl_epoch(
     if viz_vox_cpu is not None:
         model.eval()
         with torch.no_grad():
-            vox_viz   = voxels_to_device(viz_vox_cpu, device)
-            if vox_viz.feature_tensor.shape[0] > 0:
-                masked_viz, _ = sparse_block_mask(vox_viz, masking_frac, win_ch, win_tick)
-                pred_viz      = model.forward_ssl(masked_viz)
-                _visualize_ssl(vox_viz, masked_viz, pred_viz, epoch, viz_dir)
+            vox_viz_raw = voxels_to_device(viz_vox_cpu, device)
+            if vox_viz_raw.feature_tensor.shape[0] > 0:
+                vox_viz_log      = log1p_voxels(vox_viz_raw)
+                masked_viz_log, _ = sparse_block_mask(vox_viz_log, masking_frac, win_ch, win_tick)
+                pred_viz_log     = model.forward_ssl(masked_viz_log)
+                # Convert log space → raw ADC for human-readable display.
+                masked_viz_raw   = expm1_voxels(masked_viz_log)
+                pred_viz_raw     = expm1_voxels(pred_viz_log)
+                _visualize_ssl(vox_viz_raw, masked_viz_raw, pred_viz_raw, epoch, viz_dir)
         model.train()
 
     return ssl_losses
@@ -285,7 +295,7 @@ def _train_sft_epoch(
     confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
 
     for step, (vox_sft_cpu, labels) in enumerate(sft_loader):
-        vox_sft = voxels_to_device(vox_sft_cpu, device)
+        vox_sft = log1p_voxels(voxels_to_device(vox_sft_cpu, device))
         labels  = labels.to(device)
 
         valid = labels >= 0
