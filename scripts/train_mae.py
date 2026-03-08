@@ -416,22 +416,22 @@ def main(
 
     if ssl_subset_frac < 1.0:
         n_ssl_use   = max(1, int(len(ssl_dataset) * ssl_subset_frac))
-        # ssl_dataset = Subset(ssl_dataset, torch.randperm(len(ssl_dataset))[:n_ssl_use])
-        ssl_dataset = Subset(ssl_dataset, list(range(n_ssl_use)))  # deterministic subset for reproducibility
+        ssl_dataset = Subset(ssl_dataset, torch.randperm(len(ssl_dataset))[:n_ssl_use])
+        # ssl_dataset = Subset(ssl_dataset, list(range(n_ssl_use)))  # deterministic subset for reproducibility
         print(f"ssl_subset_frac={ssl_subset_frac}: using {n_ssl_use} SSL samples")
 
     if sft_subset_frac < 1.0:
         n_sft_use   = max(1, int(len(sft_dataset) * sft_subset_frac))
-        # sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use])
-        sft_dataset = Subset(sft_dataset, list(range(n_sft_use)))  # deterministic subset for reproducibility
+        sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use])
+        # sft_dataset = Subset(sft_dataset, list(range(n_sft_use)))  # deterministic subset for reproducibility
         print(f"sft_subset_frac={sft_subset_frac}: using {n_sft_use} SFT samples")
 
     ssl_loader = DataLoader(
-        ssl_dataset, batch_size=batch_size, shuffle=False,
+        ssl_dataset, batch_size=batch_size, shuffle=True,
         collate_fn=voxels_collate_fn, num_workers=num_workers,
     )
     sft_loader = DataLoader(
-        sft_dataset, batch_size=batch_size, shuffle=False,
+        sft_dataset, batch_size=batch_size, shuffle=True,
         collate_fn=voxels_label_collate_fn, num_workers=num_workers,
     )
 
