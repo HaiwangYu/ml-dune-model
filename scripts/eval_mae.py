@@ -175,7 +175,8 @@ def _module_ssl(model, dataset, device, cfg: dict) -> None:
           f"  win_ch={win_ch}  win_tick={win_tick}")
 
     n_use = min(n_samples, len(dataset))
-    subset = Subset(dataset, torch.randperm(len(dataset))[:n_use].tolist())
+    # subset = Subset(dataset, torch.randperm(len(dataset))[:n_use].tolist())
+    subset = Subset(dataset, list(range(n_use)))  # deterministic subset for reproducibility
     loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
                         collate_fn=voxels_label_collate_fn, num_workers=0)
 
@@ -338,9 +339,9 @@ def main(
     apa          = 0,
     view         = "W",
     modules      = "1",           # comma-separated: "1", "1,2", "ssl,sft"
-    n_samples    = 5,          # events to evaluate per module
+    n_samples    = 64,          # events to evaluate per module
     n_viz        = 5,             # SSL module: number of events to visualize
-    batch_size   = 16,
+    batch_size   = 64,
     masking_frac = 0.01,
     win_ch       = 3,
     win_tick     = 5,

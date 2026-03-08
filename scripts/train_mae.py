@@ -208,16 +208,21 @@ def _train_ssl_epoch(
     model, ssl_loader, opt_ssl,
     device, masking_frac, win_ch, win_tick,
     epoch, monitor, viz_dir: Path,
+    viz_batch: int = 0,
 ):
     model.train()
     ssl_losses = []
-    # Store raw CPU batch from first step for visualization (no gradient risk).
-    viz_vox_cpu = None
+    # Store raw CPU batch for end-of-epoch visualization.
+    # Targets viz_batch; falls back to batch 0 if viz_batch is out of range.
+    viz_vox_cpu  = None   # fallback: batch 0
+    viz_vox_target = None # desired: batch viz_batch
 
     for global_step, vox_cpu in enumerate(ssl_loader):
-        # Capture first valid raw CPU batch for end-of-epoch visualization.
-        if viz_vox_cpu is None and vox_cpu is not None:
+        # Capture batch 0 as fallback and the target batch if reached.
+        if global_step == 0 and vox_cpu is not None:
             viz_vox_cpu = vox_cpu
+        if global_step == viz_batch and vox_cpu is not None:
+            viz_vox_target = vox_cpu
 
         # Normalize charge: log(ADC+1) compresses 350× dynamic range to ~10×.
         vox = log1p_voxels(voxels_to_device(vox_cpu, device))
@@ -263,6 +268,10 @@ def _train_ssl_epoch(
             )
 
     # ── Visualization (end-of-epoch, model eval, no grad) ─────────────────
+    # Use the target batch; fall back to batch 0 if it was out of range.
+    if viz_vox_target is None and viz_batch != 0:
+        print(f"  [viz] batch {viz_batch} not reached — falling back to batch 0")
+    viz_vox_cpu = viz_vox_target if viz_vox_target is not None else viz_vox_cpu
     if viz_vox_cpu is not None:
         model.eval()
         with torch.no_grad():
@@ -379,6 +388,7 @@ def main(
     checkpoints_dir            = "./checkpoints",
     save_every                 = 5,
     viz_dir                    = "./viz",
+    viz_batch                  = 0,      # which batch to visualize (0-indexed); 0 if out of range
     resume                     = None,   # path to checkpoint to resume from
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
@@ -406,20 +416,22 @@ def main(
 
     if ssl_subset_frac < 1.0:
         n_ssl_use   = max(1, int(len(ssl_dataset) * ssl_subset_frac))
-        ssl_dataset = Subset(ssl_dataset, torch.randperm(len(ssl_dataset))[:n_ssl_use])
+        # ssl_dataset = Subset(ssl_dataset, torch.randperm(len(ssl_dataset))[:n_ssl_use])
+        ssl_dataset = Subset(ssl_dataset, list(range(n_ssl_use)))  # deterministic subset for reproducibility
         print(f"ssl_subset_frac={ssl_subset_frac}: using {n_ssl_use} SSL samples")
 
     if sft_subset_frac < 1.0:
         n_sft_use   = max(1, int(len(sft_dataset) * sft_subset_frac))
-        sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use])
+        # sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use])
+        sft_dataset = Subset(sft_dataset, list(range(n_sft_use)))  # deterministic subset for reproducibility
         print(f"sft_subset_frac={sft_subset_frac}: using {n_sft_use} SFT samples")
 
     ssl_loader = DataLoader(
-        ssl_dataset, batch_size=batch_size, shuffle=True,
+        ssl_dataset, batch_size=batch_size, shuffle=False,
         collate_fn=voxels_collate_fn, num_workers=num_workers,
     )
     sft_loader = DataLoader(
-        sft_dataset, batch_size=batch_size, shuffle=True,
+        sft_dataset, batch_size=batch_size, shuffle=False,
         collate_fn=voxels_label_collate_fn, num_workers=num_workers,
     )
 
@@ -476,6 +488,7 @@ def main(
             model, ssl_loader, opt_ssl,
             device, masking_frac, win_ch, win_tick,
             epoch, monitor, viz_dir,
+            viz_batch=viz_batch,
         )
         ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
         print(f"  SSL epoch {epoch} done  |  mean L1={ssl_mean:.4f}")
