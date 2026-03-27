@@ -246,7 +246,6 @@ def _train_ssl_epoch(
         # for statistics logging.
         backbone_feats = model.backbone(masked)        # Voxels [64 ch]
         pred           = model.charge_head(backbone_feats)  # Voxels [1 ch]
-        print(f"  [debug] batch {batch_idx}  backbone_feats: {backbone_feats.feature_tensor.shape}  pred: {pred.feature_tensor.shape}")
 
         if mask_bool.any():
             n_total  = pred.feature_tensor.shape[0]
