@@ -11,9 +11,10 @@ Architecture
 Training loop
 -------------
   For each SSL epoch:
-    1. One full pass through ssl_dataset (backbone + SSL head updated).
-    2. Both SFT heads are reset to random weights.
-    3. n_sft_epochs_per_ssl_epoch full passes through sft_dataset,
+    1. One full pass through ssl_train split (backbone + SSL head updated).
+    2. Validation pass through ssl_val split (no grad, same loss).
+    3. Both SFT heads are reset to random weights.
+    4. n_sft_epochs_per_ssl_epoch full passes through sft_dataset,
        training both heads in parallel (backbone frozen).
   Both heads and their optimizers are recreated fresh each SSL epoch
   for an unbiased comparison of SSL features vs. raw charge.
@@ -31,12 +32,11 @@ SFT classes
 
 Usage
 -----
-  python scripts/train_mae.py               # defaults
-  python scripts/train_mae.py --epochs=50 --batch_size=32
+  python mae/scripts/train_mae.py               # defaults
+  python mae/scripts/train_mae.py --epochs=50 --batch_size=32
 """
 
 import sys
-import math
 from pathlib import Path
 
 import fire
@@ -46,6 +46,7 @@ import torch.optim as optim
 import warp as wp
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import StepLR
+
 
 # ---------------------------------------------------------------------------
 # GPU selection helper
@@ -68,14 +69,15 @@ def _least_occupied_cuda_device() -> torch.device:
 
 
 # ── project imports ────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # project root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))          # mae/
 
 from models.mae_model import SparseMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
 from models.sparse_masking import sparse_block_mask
 from loader.apa_sparse_dataset import APASparseDataset
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset, CLASS_NAMES
 from loader.collate import voxels_collate_fn, voxels_label_collate_fn
-from legacy.metrics_monitor import MetricsMonitor
+from debug import MAEDebugger
 
 
 # ---------------------------------------------------------------------------
@@ -201,46 +203,52 @@ def _visualize_ssl(original_vox, masked_vox, pred_vox, epoch: int, viz_dir: Path
 
 
 # ---------------------------------------------------------------------------
-# One SSL epoch
+# One SSL train epoch
 # ---------------------------------------------------------------------------
 
 def _train_ssl_epoch(
     model, ssl_loader, opt_ssl,
     device, masking_frac, win_ch, win_tick,
-    epoch, monitor, viz_dir: Path,
-    viz_batch: int = 0,
-):
+    epoch, debugger: MAEDebugger, iteration_offset: int,
+    viz_dir: Path, viz_batch: int = 0,
+) -> tuple[list[float], int]:
+    """
+    Run one SSL training epoch.
+
+    Returns
+    -------
+    ssl_losses       : per-batch loss values
+    iteration_offset : updated global iteration counter after this epoch
+    """
     model.train()
     ssl_losses = []
-    # Store raw CPU batch for end-of-epoch visualization.
-    # Targets viz_batch; falls back to batch 0 if viz_batch is out of range.
-    viz_vox_cpu  = None   # fallback: batch 0
-    viz_vox_target = None # desired: batch viz_batch
+    viz_vox_cpu    = None   # fallback: batch 0
+    viz_vox_target = None   # desired: batch viz_batch
 
-    for global_step, vox_cpu in enumerate(ssl_loader):
-        # Capture batch 0 as fallback and the target batch if reached.
-        if global_step == 0 and vox_cpu is not None:
+    for batch_idx, vox_cpu in enumerate(ssl_loader):
+        iteration = iteration_offset + batch_idx
+
+        if batch_idx == 0 and vox_cpu is not None:
             viz_vox_cpu = vox_cpu
-        if global_step == viz_batch and vox_cpu is not None:
+        if batch_idx == viz_batch and vox_cpu is not None:
             viz_vox_target = vox_cpu
 
-        # Normalize charge: log(ADC+1) compresses 350× dynamic range to ~10×.
         vox = log1p_voxels(voxels_to_device(vox_cpu, device))
 
-        monitor.on_batch_begin()
-
         if vox.feature_tensor.shape[0] == 0:
-            monitor.on_batch_end(global_step, 0.0, 0)
             continue
 
         masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
-        if global_step == 0 and epoch == 1:
+        if batch_idx == 0 and epoch == 1:
             print(f"  [mask] effective masking rate: {mask_bool.float().mean():.1%}")
-        pred = model.forward_ssl(masked)
+
+        # Call backbone and charge_head separately to obtain backbone features
+        # for statistics logging.
+        backbone_feats = model.backbone(masked)        # Voxels [64 ch]
+        pred           = model.charge_head(backbone_feats)  # Voxels [1 ch]
+        print(f"  [debug] batch {batch_idx}  backbone_feats: {backbone_feats.feature_tensor.shape}  pred: {pred.feature_tensor.shape}")
 
         if mask_bool.any():
-            # Loss on ALL active voxels; masked positions upweighted so their
-            # total contribution equals that of unmasked positions.
             n_total  = pred.feature_tensor.shape[0]
             n_masked = int(mask_bool.sum())
             per_voxel = F.l1_loss(pred.feature_tensor, vox.feature_tensor,
@@ -256,19 +264,18 @@ def _train_ssl_epoch(
             )
             opt_ssl.step()
             ssl_losses.append(loss.item())
-            monitor.on_batch_end(global_step, loss.item(), n_masked)
-        else:
-            monitor.on_batch_end(global_step, 0.0, 0)
+            debugger.log_batch(epoch, batch_idx, iteration, loss.item())
+            debugger.log_feature_stats(iteration, backbone_feats.feature_tensor.detach())
+            debugger.maybe_save_histories(iteration)
 
-        if (global_step + 1) % 50 == 0:
+        if (batch_idx + 1) % 50 == 0:
             ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
             print(
-                f"  [SSL] Epoch {epoch}  step [{global_step + 1}/{len(ssl_loader)}]"
+                f"  [SSL] Epoch {epoch}  step [{batch_idx + 1}/{len(ssl_loader)}]"
                 f"  loss={ssl_mean:.4f}"
             )
 
     # ── Visualization (end-of-epoch, model eval, no grad) ─────────────────
-    # Use the target batch; fall back to batch 0 if it was out of range.
     if viz_vox_target is None and viz_batch != 0:
         print(f"  [viz] batch {viz_batch} not reached — falling back to batch 0")
     viz_vox_cpu = viz_vox_target if viz_vox_target is not None else viz_vox_cpu
@@ -277,16 +284,46 @@ def _train_ssl_epoch(
         with torch.no_grad():
             vox_viz_raw = voxels_to_device(viz_vox_cpu, device)
             if vox_viz_raw.feature_tensor.shape[0] > 0:
-                vox_viz_log      = log1p_voxels(vox_viz_raw)
+                vox_viz_log       = log1p_voxels(vox_viz_raw)
                 masked_viz_log, _ = sparse_block_mask(vox_viz_log, masking_frac, win_ch, win_tick)
-                pred_viz_log     = model.forward_ssl(masked_viz_log)
-                # Convert log space → raw ADC for human-readable display.
-                masked_viz_raw   = expm1_voxels(masked_viz_log)
-                pred_viz_raw     = expm1_voxels(pred_viz_log)
+                pred_viz_log      = model.charge_head(model.backbone(masked_viz_log))
+                masked_viz_raw    = expm1_voxels(masked_viz_log)
+                pred_viz_raw      = expm1_voxels(pred_viz_log)
                 _visualize_ssl(vox_viz_raw, masked_viz_raw, pred_viz_raw, epoch, viz_dir)
         model.train()
 
-    return ssl_losses
+    return ssl_losses, iteration_offset + len(ssl_loader)
+
+
+# ---------------------------------------------------------------------------
+# One SSL validation epoch (no grad)
+# ---------------------------------------------------------------------------
+
+def _val_ssl_epoch(
+    model, ssl_val_loader, device, masking_frac, win_ch, win_tick,
+) -> list[float]:
+    """Compute SSL reconstruction loss on the validation split (no backward pass)."""
+    model.eval()
+    val_losses = []
+    with torch.no_grad():
+        for vox_cpu in ssl_val_loader:
+            vox = log1p_voxels(voxels_to_device(vox_cpu, device))
+            if vox.feature_tensor.shape[0] == 0:
+                continue
+            masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
+            if not mask_bool.any():
+                continue
+            pred = model.charge_head(model.backbone(masked))
+            n_total  = pred.feature_tensor.shape[0]
+            n_masked = int(mask_bool.sum())
+            per_voxel = F.l1_loss(pred.feature_tensor, vox.feature_tensor,
+                                   reduction="none")[:, 0]
+            weights = torch.ones(n_total, device=device, dtype=per_voxel.dtype)
+            weights[mask_bool] = n_total / n_masked
+            loss = (per_voxel * weights).mean()
+            val_losses.append(loss.item())
+    model.train()
+    return val_losses
 
 
 # ---------------------------------------------------------------------------
@@ -382,13 +419,15 @@ def main(
     focal_gamma                = 2.0,  # focal loss gamma; 0 = plain cross-entropy
     ssl_subset_frac            = 1.0,  # fraction of SSL dataset to use
     sft_subset_frac            = 1.0,  # fraction of SFT dataset to use
+    val_frac                   = 0.2,  # fraction of SSL dataset held out for validation
     num_workers                = 0,    # set >0 only if warp is initialised in workers
     device                     = "cuda",
-    metrics_dir                = "./metrics",
     checkpoints_dir            = "./checkpoints",
     save_every                 = 5,
     viz_dir                    = "./viz",
     viz_batch                  = 0,      # which batch to visualize (0-indexed); 0 if out of range
+    debug_dir                  = "./debug",
+    debug_every                = 50,     # how often (in iterations) to log feature stats
     resume                     = None,   # path to checkpoint to resume from
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
@@ -407,27 +446,39 @@ def main(
     print(f"Device: {device}")
 
     # ── Datasets & DataLoaders ────────────────────────────────────────────
-    ssl_dataset = APASparseDataset(
+    ssl_dataset_full = APASparseDataset(
         data_root, apa=apa, view=view, frame_name="frame_rebinned_reco",
     )
     sft_dataset = APASparseMetaDataset(
         data_root, apa=apa, view=view, frame_name="frame_rebinned_reco",
     )
 
+    # Optional SSL subset before train/val split
     if ssl_subset_frac < 1.0:
-        n_ssl_use   = max(1, int(len(ssl_dataset) * ssl_subset_frac))
-        ssl_dataset = Subset(ssl_dataset, torch.randperm(len(ssl_dataset))[:n_ssl_use])
-        # ssl_dataset = Subset(ssl_dataset, list(range(n_ssl_use)))  # deterministic subset for reproducibility
+        n_ssl_use        = max(1, int(len(ssl_dataset_full) * ssl_subset_frac))
+        ssl_dataset_full = Subset(ssl_dataset_full, torch.randperm(len(ssl_dataset_full))[:n_ssl_use].tolist())
         print(f"ssl_subset_frac={ssl_subset_frac}: using {n_ssl_use} SSL samples")
+
+    # Train / val split on the (possibly subsetted) SSL dataset
+    n_ssl_total = len(ssl_dataset_full)
+    n_ssl_val   = max(1, int(n_ssl_total * val_frac))
+    n_ssl_train = n_ssl_total - n_ssl_val
+    indices     = torch.randperm(n_ssl_total).tolist()
+    ssl_train_dataset = Subset(ssl_dataset_full, indices[:n_ssl_train])
+    ssl_val_dataset   = Subset(ssl_dataset_full, indices[n_ssl_train:])
+    print(f"SSL  train={n_ssl_train}  val={n_ssl_val}")
 
     if sft_subset_frac < 1.0:
         n_sft_use   = max(1, int(len(sft_dataset) * sft_subset_frac))
-        sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use])
-        # sft_dataset = Subset(sft_dataset, list(range(n_sft_use)))  # deterministic subset for reproducibility
+        sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use].tolist())
         print(f"sft_subset_frac={sft_subset_frac}: using {n_sft_use} SFT samples")
 
-    ssl_loader = DataLoader(
-        ssl_dataset, batch_size=batch_size, shuffle=True,
+    ssl_train_loader = DataLoader(
+        ssl_train_dataset, batch_size=batch_size, shuffle=True,
+        collate_fn=voxels_collate_fn, num_workers=num_workers,
+    )
+    ssl_val_loader = DataLoader(
+        ssl_val_dataset, batch_size=batch_size, shuffle=False,
         collate_fn=voxels_collate_fn, num_workers=num_workers,
     )
     sft_loader = DataLoader(
@@ -435,7 +486,7 @@ def main(
         collate_fn=voxels_label_collate_fn, num_workers=num_workers,
     )
 
-    print(f"SSL dataset: {len(ssl_dataset)} samples  |  SFT dataset: {len(sft_dataset)} samples")
+    print(f"SFT dataset: {len(sft_dataset)} samples")
     print(f"n_sft_epochs_per_ssl_epoch={n_sft_epochs_per_ssl_epoch}")
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -447,7 +498,6 @@ def main(
         lr=lr,
     )
     sched_ssl = StepLR(opt_ssl, step_size=scheduler_step, gamma=gamma)
-    # opt_sft and opt_ref are recreated each SSL epoch after head reset (see loop below)
 
     # ── Resume from checkpoint ─────────────────────────────────────────────
     start_epoch = 1
@@ -461,41 +511,42 @@ def main(
         start_epoch = ckpt.get("epoch", 0) + 1
         print(f"Resumed from {resume}  (epoch {start_epoch - 1} → continuing from {start_epoch})")
 
-    # ── Metrics ───────────────────────────────────────────────────────────
-    monitor = MetricsMonitor("sparse_mae", save_dir=metrics_dir)
-    monitor.on_train_begin(
-        model,
-        batch_size=batch_size,
-        epochs=epochs,
-        lr=lr,
-        scheduler_step_size=scheduler_step,
-        gamma=gamma,
-    )
+    # ── Debugger ──────────────────────────────────────────────────────────
+    debugger  = MAEDebugger(debug_dir=debug_dir, debug_every=debug_every)
 
     checkpoints_dir = Path(checkpoints_dir)
     checkpoints_dir.mkdir(exist_ok=True)
     viz_dir = Path(viz_dir)
+
+    # Global iteration counter (SSL train batches only)
+    iteration = 0
 
     # ── Training loop ─────────────────────────────────────────────────────
     for epoch in range(start_epoch, epochs + 1):
         print(f"\n{'='*60}")
         print(f"SSL Epoch {epoch}/{epochs}")
 
-        monitor.on_epoch_begin(epoch)
-
-        # ── SSL epoch ─────────────────────────────────────────────────────
-        ssl_losses = _train_ssl_epoch(
-            model, ssl_loader, opt_ssl,
+        # ── SSL train epoch ───────────────────────────────────────────────
+        ssl_losses, iteration = _train_ssl_epoch(
+            model, ssl_train_loader, opt_ssl,
             device, masking_frac, win_ch, win_tick,
-            epoch, monitor, viz_dir,
-            viz_batch=viz_batch,
+            epoch, debugger, iteration,
+            viz_dir=viz_dir, viz_batch=viz_batch,
         )
         ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
-        print(f"  SSL epoch {epoch} done  |  mean L1={ssl_mean:.4f}")
+        print(f"  SSL train epoch {epoch} done  |  mean L1={ssl_mean:.4f}")
         sched_ssl.step()
 
+        # ── SSL validation epoch ──────────────────────────────────────────
+        val_losses = _val_ssl_epoch(
+            model, ssl_val_loader, device, masking_frac, win_ch, win_tick,
+        )
+        val_mean = sum(val_losses) / len(val_losses) if val_losses else float("nan")
+        print(f"  SSL val   epoch {epoch} done  |  mean L1={val_mean:.4f}")
+        debugger.log_val_epoch(epoch, iteration, val_mean)
+        debugger.save_histories()
+
         # ── SFT epochs ────────────────────────────────────────────────────
-        # Reset both heads + recreate optimizers for a fair per-epoch comparison.
         model.reset_sft_head()
         opt_sft = optim.AdamW(model.nu_flavor_head.parameters(),     lr=lr)
         opt_ref = optim.AdamW(model.ref_nu_flavor_head.parameters(), lr=lr)
@@ -535,7 +586,7 @@ def main(
         ref_acc   = 100.0 * int(confusion_ref.diagonal().sum()) / total_ref if total_ref > 0 else 0.0
 
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch:3d}  |  SSL L1={ssl_mean:.4f}")
+        print(f"Epoch {epoch:3d}  |  SSL train L1={ssl_mean:.4f}  val L1={val_mean:.4f}")
         print(f"  SSL features  :  CE={sft_mean:.4f}  acc={sft_acc:.1f}%")
         print(f"  Raw charge ref:  CE={ref_mean:.4f}  acc={ref_acc:.1f}%")
         print(f"\n  [SSL features]")
@@ -546,23 +597,15 @@ def main(
         _print_class_metrics(confusion_ref, CLASS_NAMES)
         print(f"{'='*60}\n")
 
-        monitor.on_validation_begin(epoch)
-        monitor.on_validation_end()
-        monitor.on_epoch_end(epoch, sft_mean if not math.isnan(sft_mean) else 0.0, sft_acc)
-
         if epoch % save_every == 0 or epoch == epochs:
-            ckpt = checkpoints_dir / f"mae_epoch{epoch}.pt"
+            ckpt_path = checkpoints_dir / f"mae_epoch{epoch}.pt"
             torch.save({
-                "epoch":    epoch,
-                "model":    model.state_dict(),
-                "opt_ssl":  opt_ssl.state_dict(),
+                "epoch":     epoch,
+                "model":     model.state_dict(),
+                "opt_ssl":   opt_ssl.state_dict(),
                 "sched_ssl": sched_ssl.state_dict(),
-            }, ckpt)
-            monitor.save()
-            print(f"Checkpoint saved: {ckpt}")
-
-    monitor.print_summary()
-    monitor.save()
+            }, ckpt_path)
+            print(f"Checkpoint saved: {ckpt_path}")
 
 
 if __name__ == "__main__":
