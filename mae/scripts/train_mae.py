@@ -37,6 +37,7 @@ Usage
 """
 
 import sys
+import logging
 from pathlib import Path
 
 import fire
@@ -47,6 +48,12 @@ import warp as wp
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import StepLR
 
+
+# Suppress warpconvnet kernel-map cache-miss warnings.
+# In true-MAE mode the visible coordinate set changes every batch (random
+# masking), so the kernel map can never be reused — the warning fires once
+# per conv layer per batch and is expected, not an error.
+logging.getLogger("warpconvnet").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # GPU selection helper
@@ -72,8 +79,8 @@ def _least_occupied_cuda_device() -> torch.device:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))          # mae/
 
-from models.mae_model import SparseMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
-from models.sparse_masking import sparse_block_mask
+from models.mae_model import SparseMAEModel, SparseTrueMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
+from models.sparse_masking import sparse_block_mask, sparse_block_mask_visible
 from loader.apa_sparse_dataset import APASparseDataset
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset, CLASS_NAMES
 from loader.collate import voxels_collate_fn, voxels_label_collate_fn
@@ -211,6 +218,7 @@ def _train_ssl_epoch(
     device, masking_frac, win_ch, win_tick,
     epoch, debugger: MAEDebugger, iteration_offset: int,
     viz_dir: Path, viz_batch: int = 0,
+    true_mae: bool = False,
 ) -> tuple[list[float], int]:
     """
     Run one SSL training epoch.
@@ -238,14 +246,20 @@ def _train_ssl_epoch(
         if vox.feature_tensor.shape[0] == 0:
             continue
 
-        masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
+        if true_mae:
+            vox_in, mask_bool = sparse_block_mask_visible(vox, masking_frac, win_ch, win_tick)
+        else:
+            vox_in, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
         if batch_idx == 0 and epoch == 1:
             print(f"  [mask] effective masking rate: {mask_bool.float().mean():.1%}")
 
         # Call backbone and charge_head separately to obtain backbone features
         # for statistics logging.
-        backbone_feats = model.backbone(masked)        # Voxels [64 ch]
-        pred           = model.charge_head(backbone_feats)  # Voxels [1 ch]
+        if true_mae:
+            backbone_feats = model.backbone(vox_in, vox)  # Voxels [N_union, 64]
+        else:
+            backbone_feats = model.backbone(vox_in)        # Voxels [N_all, 64]
+        pred = model.charge_head(backbone_feats)           # Voxels [1 ch]
 
         if mask_bool.any():
             n_total  = pred.feature_tensor.shape[0]
@@ -283,11 +297,17 @@ def _train_ssl_epoch(
         with torch.no_grad():
             vox_viz_raw = voxels_to_device(viz_vox_cpu, device)
             if vox_viz_raw.feature_tensor.shape[0] > 0:
-                vox_viz_log       = log1p_voxels(vox_viz_raw)
-                masked_viz_log, _ = sparse_block_mask(vox_viz_log, masking_frac, win_ch, win_tick)
-                pred_viz_log      = model.charge_head(model.backbone(masked_viz_log))
-                masked_viz_raw    = expm1_voxels(masked_viz_log)
-                pred_viz_raw      = expm1_voxels(pred_viz_log)
+                vox_viz_log = log1p_voxels(vox_viz_raw)
+                if true_mae:
+                    viz_in, _ = sparse_block_mask_visible(vox_viz_log, masking_frac, win_ch, win_tick)
+                    pred_viz_log = model.charge_head(model.backbone(viz_in, vox_viz_log))
+                    # For visualization show a zero-out version as "masked input"
+                    masked_viz_log, _ = sparse_block_mask(vox_viz_log, masking_frac, win_ch, win_tick)
+                else:
+                    masked_viz_log, _ = sparse_block_mask(vox_viz_log, masking_frac, win_ch, win_tick)
+                    pred_viz_log = model.charge_head(model.backbone(masked_viz_log))
+                masked_viz_raw = expm1_voxels(masked_viz_log)
+                pred_viz_raw   = expm1_voxels(pred_viz_log)
                 _visualize_ssl(vox_viz_raw, masked_viz_raw, pred_viz_raw, epoch, viz_dir)
         model.train()
 
@@ -300,6 +320,7 @@ def _train_ssl_epoch(
 
 def _val_ssl_epoch(
     model, ssl_val_loader, device, masking_frac, win_ch, win_tick,
+    true_mae: bool = False,
 ) -> list[float]:
     """Compute SSL reconstruction loss on the validation split (no backward pass)."""
     model.eval()
@@ -309,10 +330,16 @@ def _val_ssl_epoch(
             vox = log1p_voxels(voxels_to_device(vox_cpu, device))
             if vox.feature_tensor.shape[0] == 0:
                 continue
-            masked, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
+            if true_mae:
+                vox_in, mask_bool = sparse_block_mask_visible(vox, masking_frac, win_ch, win_tick)
+            else:
+                vox_in, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
             if not mask_bool.any():
                 continue
-            pred = model.charge_head(model.backbone(masked))
+            if true_mae:
+                pred = model.charge_head(model.backbone(vox_in, vox))
+            else:
+                pred = model.charge_head(model.backbone(vox_in))
             n_total  = pred.feature_tensor.shape[0]
             n_masked = int(mask_bool.sum())
             per_voxel = F.l1_loss(pred.feature_tensor, vox.feature_tensor,
@@ -427,6 +454,7 @@ def main(
     viz_batch                  = 0,      # which batch to visualize (0-indexed); 0 if out of range
     debug_dir                  = "./debug",
     debug_every                = 50,     # how often (in iterations) to log feature stats
+    true_mae                   = False,  # True → remove masked voxels from encoder input
     resume                     = None,   # path to checkpoint to resume from
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
@@ -489,7 +517,11 @@ def main(
     print(f"n_sft_epochs_per_ssl_epoch={n_sft_epochs_per_ssl_epoch}")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = SparseMAEModel(n_classes=n_classes).to(device)
+    if true_mae:
+        model = SparseTrueMAEModel(n_classes=n_classes).to(device)
+        print("Using true MAE (coordinate-removal masking)")
+    else:
+        model = SparseMAEModel(n_classes=n_classes).to(device)
 
     # ── Optimizers ────────────────────────────────────────────────────────
     opt_ssl = optim.AdamW(
@@ -531,6 +563,7 @@ def main(
             device, masking_frac, win_ch, win_tick,
             epoch, debugger, iteration,
             viz_dir=viz_dir, viz_batch=viz_batch,
+            true_mae=true_mae,
         )
         ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
         print(f"  SSL train epoch {epoch} done  |  mean L1={ssl_mean:.4f}")
@@ -539,6 +572,7 @@ def main(
         # ── SSL validation epoch ──────────────────────────────────────────
         val_losses = _val_ssl_epoch(
             model, ssl_val_loader, device, masking_frac, win_ch, win_tick,
+            true_mae=true_mae,
         )
         val_mean = sum(val_losses) / len(val_losses) if val_losses else float("nan")
         print(f"  SSL val   epoch {epoch} done  |  mean L1={val_mean:.4f}")

@@ -10,7 +10,7 @@ from warpconvnet.geometry.coords.integer import IntCoords
 from warpconvnet.geometry.features.cat import CatFeatures
 from warpconvnet.nn.modules.sparse_conv import SparseConv2d
 
-from .minkunet_attention import MinkUNetSparseAttentionCore
+from .minkunet_attention import MinkUNetSparseAttentionCore, MinkUNetTrueMAECore
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +264,100 @@ class SparseMAEModel(nn.Module):
         the current backbone features and raw charge from a clean slate,
         giving an unbiased comparison at each SSL checkpoint.
         """
+        for m in self.nu_flavor_head.modules():
+            if hasattr(m, 'reset_parameters'):
+                m.reset_parameters()
+        for m in self.ref_nu_flavor_head.modules():
+            if hasattr(m, 'reset_parameters'):
+                m.reset_parameters()
+
+
+# ---------------------------------------------------------------------------
+# True MAE model
+# ---------------------------------------------------------------------------
+
+class SparseTrueMAEModel(nn.Module):
+    """
+    Sparse Masked Autoencoder with true coordinate-removal masking.
+
+    The encoder receives only C_visible (unmasked voxels).  The decoder
+    expands back to C_union (all original voxels) via union-guided transposed
+    convolutions and zero-filled skip connections.  This prevents the network
+    from using topology hints at masked positions.
+
+    Components
+    ----------
+    backbone           : MinkUNetTrueMAECore  (C_visible, C_union → C_union [64ch])
+    charge_head        : 1×1 SparseConv2d(64→1)   SSL reconstruction head
+    nu_flavor_head     : SparseCNNHead(in_ch=64)   SFT head on backbone features
+    ref_nu_flavor_head : SparseCNNHead(in_ch=1)    SFT reference on raw charge
+
+    SSL usage:
+        vox_visible, mask_bool = sparse_block_mask_visible(vox, ...)
+        pred = model.forward_ssl(vox_visible, vox)
+        loss = weighted_l1(pred.feature_tensor, vox.feature_tensor, mask_bool)
+
+    SFT usage (no masking):
+        model.freeze_backbone()
+        logits = model.forward_sft(vox)
+    """
+
+    def __init__(
+        self,
+        n_classes:        int   = 3,
+        spatial_encoding: bool  = True,
+        flash_attention:  bool  = True,
+        encoding_dim:     int   = 32,
+        encoding_range:   float = 300.0,
+    ):
+        super().__init__()
+        self.backbone = MinkUNetTrueMAECore(
+            spatial_encoding=spatial_encoding,
+            flash_attention=flash_attention,
+            encoding_dim=encoding_dim,
+            encoding_range=encoding_range,
+        )
+        self.charge_head        = SparseConv2d(64, 1, kernel_size=1, bias=True)
+        self.nu_flavor_head     = SparseCNNHead(in_ch=64, n_classes=n_classes)
+        self.ref_nu_flavor_head = SparseCNNHead(in_ch=1,  n_classes=n_classes)
+
+    def forward_ssl(self, vox_visible: Voxels, vox_union: Voxels) -> Voxels:
+        """
+        SSL forward pass.
+
+        Parameters
+        ----------
+        vox_visible : Voxels — visible voxels only (output of sparse_block_mask_visible)
+        vox_union   : Voxels — all original voxels (C_union); also the reconstruction target
+
+        Returns
+        -------
+        Voxels at C_union with 1 feature channel (predicted log1p charge).
+        pred.feature_tensor has the same length as vox_union.feature_tensor,
+        so mask_bool (which indexes into C_union) applies directly.
+        """
+        feats = self.backbone(vox_visible, vox_union)   # [N_union, 64]
+        return self.charge_head(feats)                   # [N_union, 1]
+
+    def forward_sft(self, voxels: Voxels) -> Tensor:
+        """SFT forward using backbone features (no masking; visible == union)."""
+        with torch.no_grad():
+            feats = self.backbone(voxels, voxels)
+        return self.nu_flavor_head(feats)
+
+    def forward_sft_ref(self, voxels: Voxels) -> Tensor:
+        """SFT reference forward on raw 1-ch charge (no backbone)."""
+        return self.ref_nu_flavor_head(voxels)
+
+    def freeze_backbone(self):
+        self.backbone.requires_grad_(False)
+        self.backbone.eval()
+
+    def unfreeze_backbone(self):
+        self.backbone.requires_grad_(True)
+        self.backbone.train()
+
+    def reset_sft_head(self):
         for m in self.nu_flavor_head.modules():
             if hasattr(m, 'reset_parameters'):
                 m.reset_parameters()
