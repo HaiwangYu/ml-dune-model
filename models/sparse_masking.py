@@ -250,6 +250,11 @@ def zero_fill_skip(encoder_skip: Voxels, union_ref: Voxels) -> Voxels:
     B = len(union_offsets) - 1
     for i in range(B):
         u0, u1 = int(union_offsets[i]), int(union_offsets[i + 1])
+        # warpconvnet rebuilds offsets via torch.bincount(batch_index), which
+        # silently drops trailing batch items that have no voxels.  Guard
+        # against skip_offsets being shorter than union_offsets.
+        if i + 1 >= len(skip_offsets):
+            continue  # no visible voxels reached the encoder for this item
         s0, s1 = int(skip_offsets[i]),  int(skip_offsets[i + 1])
 
         if s0 == s1 or u0 == u1:
@@ -282,3 +287,94 @@ def zero_fill_skip(encoder_skip: Voxels, union_ref: Voxels) -> Voxels:
         batched_features=CatFeatures(filled, offsets=union_offsets),
         offsets=union_offsets,
     )
+
+
+def sparse_patch_mask_visible(
+    voxels: Voxels,
+    patch_ch: int,
+    patch_tick: int,
+    mask_frac: float,
+) -> tuple[Voxels, torch.Tensor, torch.Tensor]:
+    """
+    Patch-level TrueMAE masking (PoLAr-MAE style).
+
+    Groups active voxels into (patch_ch × patch_tick) spatial bins, randomly
+    masks mask_frac of non-empty bins per batch item, and removes masked voxels
+    from the sparse tensor entirely.
+
+    Parameters
+    ----------
+    voxels    : batched Voxels; coordinates are (channel, tick) int32
+    patch_ch  : patch height in channel direction
+    patch_tick: patch width  in tick direction
+    mask_frac : fraction of non-empty patches to mask, in [0, 1]
+
+    Returns
+    -------
+    vox_visible : Voxels — only voxels belonging to unmasked patches
+    mask_bool   : BoolTensor [N_total] — True at masked voxel positions
+    patch_ids   : LongTensor [N_total] — unique patch index per voxel across
+                  the whole batch (used to group voxels by patch for the
+                  coordinate reconstruction loss)
+    """
+    coords  = voxels.coordinate_tensor   # [N, 2] (channel, tick) int32
+    feats   = voxels.feature_tensor      # [N, C]
+    offsets = voxels.offsets             # [B+1], CPU
+    device  = coords.device
+    N_total = coords.shape[0]
+
+    mask_bool = torch.zeros(N_total, dtype=torch.bool,  device=device)
+    patch_ids = torch.zeros(N_total, dtype=torch.long,  device=device)
+
+    B = len(offsets) - 1
+    patch_counter = 0
+    for i in range(B):
+        s = int(offsets[i])
+        e = int(offsets[i + 1])
+        if s == e:
+            continue
+        c = coords[s:e]  # [N_i, 2]
+
+        # Assign each voxel to its (bin_ch, bin_tick) grid cell.
+        bin_ch   = (c[:, 0].long() // patch_ch)
+        bin_tick = (c[:, 1].long() // patch_tick)
+        # Encode 2-D bin index as a single integer key.
+        # Using a tick stride that exceeds the maximum bin_tick value.
+        tick_stride = int(c[:, 1].max().item()) // patch_tick + 2
+        keys = bin_ch * tick_stride + bin_tick   # [N_i]
+
+        unique_keys, inv_idx = torch.unique(keys, return_inverse=True)
+        patch_ids[s:e] = inv_idx + patch_counter
+
+        n_patches = len(unique_keys)
+        n_mask    = max(1, int(math.ceil(mask_frac * n_patches)))
+        perm      = torch.randperm(n_patches, device=device)
+        masked_flags                   = torch.zeros(n_patches, dtype=torch.bool, device=device)
+        masked_flags[perm[:n_mask]]    = True
+        mask_bool[s:e]                 = masked_flags[inv_idx]
+
+        patch_counter += n_patches
+
+    # Remove masked voxels; ensure ≥1 visible voxel per batch item.
+    vis = ~mask_bool
+    for i in range(B):
+        s = int(offsets[i])
+        e = int(offsets[i + 1])
+        if e > s and not vis[s:e].any():
+            vis[s] = True
+
+    new_coords = coords[vis]
+    new_feats  = feats[vis]
+    new_off    = [0]
+    for i in range(B):
+        s = int(offsets[i])
+        e = int(offsets[i + 1])
+        new_off.append(new_off[-1] + int(vis[s:e].sum().item()))
+    new_offsets = torch.tensor(new_off, dtype=offsets.dtype)
+
+    vox_visible = Voxels(
+        batched_coordinates=IntCoords(new_coords, offsets=new_offsets),
+        batched_features=CatFeatures(new_feats, offsets=new_offsets),
+        offsets=new_offsets,
+    )
+    return vox_visible, mask_bool, patch_ids

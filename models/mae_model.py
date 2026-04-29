@@ -198,6 +198,10 @@ class SparseMAEModel(nn.Module):
         # SSL head: 64 → 1 feature channel (charge reconstruction)
         self.charge_head = SparseConv2d(64, 1, kernel_size=1, bias=True)
 
+        # Coordinate reconstruction head: predicts (Δchannel, Δtick) per voxel
+        # Used in patch-MAE mode to reconstruct local point geometry (PoLAr-MAE).
+        self.coord_head = SparseConv2d(64, 2, kernel_size=1, bias=True)
+
         # SFT head on backbone features (64 ch)
         self.nu_flavor_head = SparseCNNHead(in_ch=64, n_classes=n_classes)
 
@@ -318,6 +322,7 @@ class SparseTrueMAEModel(nn.Module):
             encoding_range=encoding_range,
         )
         self.charge_head        = SparseConv2d(64, 1, kernel_size=1, bias=True)
+        self.coord_head         = SparseConv2d(64, 2, kernel_size=1, bias=True)
         self.nu_flavor_head     = SparseCNNHead(in_ch=64, n_classes=n_classes)
         self.ref_nu_flavor_head = SparseCNNHead(in_ch=1,  n_classes=n_classes)
 

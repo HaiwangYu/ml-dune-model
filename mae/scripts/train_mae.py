@@ -80,7 +80,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # projec
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))          # mae/
 
 from models.mae_model import SparseMAEModel, SparseTrueMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
-from models.sparse_masking import sparse_block_mask, sparse_block_mask_visible
+from models.sparse_masking import sparse_block_mask, sparse_block_mask_visible, sparse_patch_mask_visible
 from loader.apa_sparse_dataset import APASparseDataset
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset, CLASS_NAMES
 from loader.collate import voxels_collate_fn, voxels_label_collate_fn
@@ -104,6 +104,74 @@ def focal_loss(logits: torch.Tensor, targets: torch.Tensor, gamma: float = 2.0) 
     ce  = F.cross_entropy(logits, targets, reduction="none")   # (N,)
     pt  = torch.exp(-ce)                                        # confidence on correct class
     return ((1.0 - pt) ** gamma * ce).mean()
+
+
+def vicreg_loss(
+    features: torch.Tensor,
+    lambda_v: float = 25.0,
+    lambda_c: float = 1.0,
+    gamma: float = 1.0,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """
+    VICReg variance + covariance regularization to prevent dimensional collapse.
+
+    Variance term:   penalizes dimensions whose std < gamma.
+    Covariance term: penalizes off-diagonal entries of the feature covariance matrix.
+
+    features : [N, D] backbone feature tensor for the current batch
+    """
+    if features.shape[0] < 2:
+        return features.new_tensor(0.0)
+    z = features - features.mean(dim=0)
+    std = (z.var(dim=0) + eps).sqrt()
+    loss_v = F.relu(gamma - std).mean()
+    N, D = z.shape
+    cov = (z.T @ z) / (N - 1)
+    off_diag = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
+    loss_c = off_diag / D
+    return lambda_v * loss_v + lambda_c * loss_c
+
+
+def patch_reconstruction_loss(
+    pred_coords: torch.Tensor,
+    true_coords: torch.Tensor,
+    pred_charge: torch.Tensor,
+    true_charge: torch.Tensor,
+    patch_ids:   torch.Tensor,
+    lambda_coord:  float = 1.0,
+    lambda_charge: float = 1.0,
+) -> torch.Tensor:
+    """
+    Per-patch Chamfer Distance on predicted voxel coordinates + L1 charge loss.
+
+    For each patch, normalizes coordinates to patch-local [-1, 1] space before
+    computing the symmetric Chamfer Distance, making the loss scale-invariant
+    to patch dimensions.  Inspired by PoLAr-MAE (arxiv 2502.02558).
+
+    pred_coords : [N_masked, 2]  predicted (channel, tick) — raw backbone output
+    true_coords : [N_masked, 2]  ground-truth (channel, tick) — original voxel coords
+    pred_charge : [N_masked]     predicted log1p charge
+    true_charge : [N_masked]     ground-truth log1p charge
+    patch_ids   : [N_masked]     patch index per voxel (from sparse_patch_mask_visible)
+    """
+    unique_patches = patch_ids.unique()
+    chamfer_terms = []
+    for pid in unique_patches:
+        sel = patch_ids == pid
+        tc = true_coords[sel].float()   # [K, 2]
+        pc = pred_coords[sel].float()   # [K, 2]
+        center = tc.mean(dim=0)
+        scale  = (tc - center).abs().max().clamp(min=1.0)
+        tc_n   = (tc - center) / scale
+        pc_n   = (pc - center) / scale
+        # Symmetric Chamfer Distance
+        d1 = ((tc_n.unsqueeze(0) - pc_n.unsqueeze(1)) ** 2).sum(-1).min(dim=1).values
+        d2 = ((pc_n.unsqueeze(0) - tc_n.unsqueeze(1)) ** 2).sum(-1).min(dim=0).values
+        chamfer_terms.append((d1.mean() + d2.mean()) / 2)
+    loss_coord  = torch.stack(chamfer_terms).mean() if chamfer_terms else pred_coords.new_tensor(0.0)
+    loss_charge = F.l1_loss(pred_charge, true_charge)
+    return lambda_coord * loss_coord + lambda_charge * loss_charge
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +287,14 @@ def _train_ssl_epoch(
     epoch, debugger: MAEDebugger, iteration_offset: int,
     viz_dir: Path, viz_batch: int = 0,
     true_mae: bool = False,
+    vicreg_lambda_v: float = 0.0,
+    vicreg_lambda_c: float = 0.0,
+    use_patch_mae: bool = False,
+    patch_ch: int = 15,
+    patch_tick: int = 25,
+    patch_mask_frac: float = 0.60,
+    lambda_coord: float = 1.0,
+    lambda_charge: float = 1.0,
 ) -> tuple[list[float], int]:
     """
     Run one SSL training epoch.
@@ -246,35 +322,58 @@ def _train_ssl_epoch(
         if vox.feature_tensor.shape[0] == 0:
             continue
 
-        if true_mae:
+        if use_patch_mae:
+            vox_in, mask_bool, patch_ids = sparse_patch_mask_visible(
+                vox, patch_ch, patch_tick, patch_mask_frac)
+        elif true_mae:
             vox_in, mask_bool = sparse_block_mask_visible(vox, masking_frac, win_ch, win_tick)
         else:
             vox_in, mask_bool = sparse_block_mask(vox, masking_frac, win_ch, win_tick)
         if batch_idx == 0 and epoch == 1:
             print(f"  [mask] effective masking rate: {mask_bool.float().mean():.1%}")
 
-        # Call backbone and charge_head separately to obtain backbone features
-        # for statistics logging.
-        if true_mae:
+        # Backbone forward — always TrueMAE-style when use_patch_mae or true_mae.
+        if use_patch_mae or true_mae:
             backbone_feats = model.backbone(vox_in, vox)  # Voxels [N_union, 64]
         else:
             backbone_feats = model.backbone(vox_in)        # Voxels [N_all, 64]
-        pred = model.charge_head(backbone_feats)           # Voxels [1 ch]
 
         if mask_bool.any():
-            n_total  = pred.feature_tensor.shape[0]
-            n_masked = int(mask_bool.sum())
-            per_voxel = F.l1_loss(pred.feature_tensor, vox.feature_tensor,
-                                   reduction="none")[:, 0]   # [N]
-            weights = torch.ones(n_total, device=device, dtype=per_voxel.dtype)
-            weights[mask_bool] = n_total / n_masked
-            loss = (per_voxel * weights).mean()
+            if use_patch_mae:
+                # Patch-MAE: Chamfer coordinate loss + charge loss
+                pred_charge_vox = model.charge_head(backbone_feats)
+                pred_coord_vox  = model.coord_head(backbone_feats)
+                masked_patch_ids = patch_ids[mask_bool]
+                loss = patch_reconstruction_loss(
+                    pred_coord_vox.feature_tensor[mask_bool],
+                    vox.coordinate_tensor[mask_bool].float(),
+                    pred_charge_vox.feature_tensor[mask_bool, 0],
+                    vox.feature_tensor[mask_bool, 0],
+                    masked_patch_ids,
+                    lambda_coord=lambda_coord,
+                    lambda_charge=lambda_charge,
+                )
+                clip_params = (list(model.backbone.parameters())
+                               + list(model.charge_head.parameters())
+                               + list(model.coord_head.parameters()))
+            else:
+                # Standard block-mask: charge reconstruction only
+                pred = model.charge_head(backbone_feats)
+                per_voxel = F.l1_loss(pred.feature_tensor, vox.feature_tensor,
+                                       reduction="none")[:, 0]
+                loss = per_voxel[mask_bool].mean()
+                clip_params = (list(model.backbone.parameters())
+                               + list(model.charge_head.parameters()))
+
+            if vicreg_lambda_v > 0 or vicreg_lambda_c > 0:
+                loss = loss + vicreg_loss(
+                    backbone_feats.feature_tensor,
+                    lambda_v=vicreg_lambda_v,
+                    lambda_c=vicreg_lambda_c,
+                )
             opt_ssl.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(model.backbone.parameters()) + list(model.charge_head.parameters()),
-                max_norm=1.0,
-            )
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
             opt_ssl.step()
             ssl_losses.append(loss.item())
             debugger.log_batch(epoch, batch_idx, iteration, loss.item())
@@ -340,13 +439,9 @@ def _val_ssl_epoch(
                 pred = model.charge_head(model.backbone(vox_in, vox))
             else:
                 pred = model.charge_head(model.backbone(vox_in))
-            n_total  = pred.feature_tensor.shape[0]
-            n_masked = int(mask_bool.sum())
             per_voxel = F.l1_loss(pred.feature_tensor, vox.feature_tensor,
                                    reduction="none")[:, 0]
-            weights = torch.ones(n_total, device=device, dtype=per_voxel.dtype)
-            weights[mask_bool] = n_total / n_masked
-            loss = (per_voxel * weights).mean()
+            loss = per_voxel[mask_bool].mean()
             val_losses.append(loss.item())
     model.train()
     return val_losses
@@ -432,15 +527,15 @@ def main(
     data_root                  = "/nfs/data/1/yuhw/cffm-data/prod-jay-1M-2026-02-27",
     apa                        = 0,
     view                       = "W",
-    batch_size                 = 64,
+    batch_size                 = 16,
     epochs                     = 2,
     lr                         = 1e-3,
     scheduler_step             = 10,
     gamma                      = 0.7,
     n_sft_epochs_per_ssl_epoch = 3,    # full SFT epochs per SSL epoch
-    masking_frac               = 0.01,
-    win_ch                     = 3,
-    win_tick                   = 5,
+    masking_frac               = 0.5,
+    win_ch                     = 30,
+    win_tick                   = 50,
     n_classes                  = 3,
     focal_gamma                = 2.0,  # focal loss gamma; 0 = plain cross-entropy
     ssl_subset_frac            = 1.0,  # fraction of SSL dataset to use
@@ -454,7 +549,15 @@ def main(
     viz_batch                  = 0,      # which batch to visualize (0-indexed); 0 if out of range
     debug_dir                  = "./debug",
     debug_every                = 50,     # how often (in iterations) to log feature stats
-    true_mae                   = False,  # True → remove masked voxels from encoder input
+    true_mae                   = True,   # True → remove masked voxels from encoder input
+    vicreg_lambda_v            = 0.0,   # VICReg variance weight  (0 = disabled)
+    vicreg_lambda_c            = 0.0,   # VICReg covariance weight (0 = disabled)
+    use_patch_mae              = False,  # True → patch-level masking + coordinate reconstruction
+    patch_ch                   = 15,    # patch height in channels
+    patch_tick                 = 25,    # patch width  in ticks
+    patch_mask_frac            = 0.60,  # fraction of non-empty patches to mask
+    lambda_coord               = 1.0,   # weight for Chamfer coordinate loss
+    lambda_charge              = 1.0,   # weight for charge reconstruction loss (patch-MAE mode)
     resume                     = None,   # path to checkpoint to resume from
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
@@ -524,10 +627,10 @@ def main(
         model = SparseMAEModel(n_classes=n_classes).to(device)
 
     # ── Optimizers ────────────────────────────────────────────────────────
-    opt_ssl = optim.AdamW(
-        list(model.backbone.parameters()) + list(model.charge_head.parameters()),
-        lr=lr,
-    )
+    ssl_params = list(model.backbone.parameters()) + list(model.charge_head.parameters())
+    if use_patch_mae:
+        ssl_params += list(model.coord_head.parameters())
+    opt_ssl = optim.AdamW(ssl_params, lr=lr)
     sched_ssl = StepLR(opt_ssl, step_size=scheduler_step, gamma=gamma)
 
     # ── Resume from checkpoint ─────────────────────────────────────────────
@@ -564,6 +667,14 @@ def main(
             epoch, debugger, iteration,
             viz_dir=viz_dir, viz_batch=viz_batch,
             true_mae=true_mae,
+            vicreg_lambda_v=vicreg_lambda_v,
+            vicreg_lambda_c=vicreg_lambda_c,
+            use_patch_mae=use_patch_mae,
+            patch_ch=patch_ch,
+            patch_tick=patch_tick,
+            patch_mask_frac=patch_mask_frac,
+            lambda_coord=lambda_coord,
+            lambda_charge=lambda_charge,
         )
         ssl_mean = sum(ssl_losses) / len(ssl_losses) if ssl_losses else float("nan")
         print(f"  SSL train epoch {epoch} done  |  mean L1={ssl_mean:.4f}")
