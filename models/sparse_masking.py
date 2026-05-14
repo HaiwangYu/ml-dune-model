@@ -60,12 +60,17 @@ def sparse_block_mask(
         seed_idx  = torch.randperm(N_i, device=device)[:n_seeds]
         seeds     = coords_i[seed_idx]                       # (n_seeds, 2)
 
-        # Vectorised window check:
-        #   diff[n, s, d] = coords_i[n, d] - seeds[s, d]
-        diff   = coords_i.unsqueeze(1) - seeds.unsqueeze(0)  # (N_i, n_seeds, 2)
-        in_win = (diff[:, :, 0].abs() <= win_ch) & \
-                 (diff[:, :, 1].abs() <= win_tick)            # (N_i, n_seeds)
-        mask_bool[start:end] = in_win.any(dim=1)             # (N_i,)
+        _CHUNK = 1024
+        mask_i = torch.zeros(N_i, dtype=torch.bool, device=device)
+        for s in range(0, n_seeds, _CHUNK):
+            seeds_c  = seeds[s:s + _CHUNK]
+            diff_c   = coords_i.unsqueeze(1) - seeds_c.unsqueeze(0)  # (N_i, chunk, 2)
+            in_win_c = (diff_c[:, :, 0].abs() <= win_ch) & \
+                       (diff_c[:, :, 1].abs() <= win_tick)
+            mask_i  |= in_win_c.any(dim=1)
+            if mask_i.all():
+                break
+        mask_bool[start:end] = mask_i
 
     # Clone features and zero out masked positions; keep coordinates intact.
     new_feats = feats.clone()
@@ -133,10 +138,17 @@ def sparse_block_mask_visible(
         coords_i = coords[start:end]
         seed_idx = torch.randperm(N_i, device=device)[:n_seeds]
         seeds    = coords_i[seed_idx]
-        diff     = coords_i.unsqueeze(1) - seeds.unsqueeze(0)   # [N_i, n_seeds, 2]
-        in_win   = (diff[:, :, 0].abs() <= win_ch) & \
-                   (diff[:, :, 1].abs() <= win_tick)             # [N_i, n_seeds]
-        mask_bool[start:end] = in_win.any(dim=1)
+        _CHUNK = 1024
+        mask_i = torch.zeros(N_i, dtype=torch.bool, device=device)
+        for s in range(0, n_seeds, _CHUNK):
+            seeds_c  = seeds[s:s + _CHUNK]
+            diff_c   = coords_i.unsqueeze(1) - seeds_c.unsqueeze(0)   # [N_i, chunk, 2]
+            in_win_c = (diff_c[:, :, 0].abs() <= win_ch) & \
+                       (diff_c[:, :, 1].abs() <= win_tick)
+            mask_i  |= in_win_c.any(dim=1)
+            if mask_i.all():
+                break
+        mask_bool[start:end] = mask_i
 
     # Keep only visible (un-masked) voxels and recompute CSR offsets.
     vis = ~mask_bool
