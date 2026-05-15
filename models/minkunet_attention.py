@@ -4,25 +4,15 @@
 #   Bottleneck: Self-attention at small resolution (global context)
 #   Decoder:   Sparse upsampling (transposed convolutions) + skip connections + residual blocks
 #   Head:      Dense global pooling and classification
-#
-# The backbone is split into three composable modules:
-#
-#   FromDense                       Dense Tensor  →  Voxels
-#   MinkUNetSparseAttentionCore     Voxels        →  Voxels   (all learnable layers)
-#   ToDense                         Voxels        →  Dense Tensor
-#
-# MinkUNetSparseAttention composes all three for the original Dense → Dense interface.
-# Use MinkUNetSparseAttentionCore directly when input already arrives as Voxels
-# (e.g. from APASparseDataset), avoiding the from_dense overhead entirely.
 
 from torch import Tensor
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
+import torch.nn.functional as F    # Functional layer calls (stateless)
+import torch.nn as nn              # Neural network base classes
 
-from warpconvnet.geometry.types.voxels import Voxels
-from warpconvnet.nn.functional.transforms import cat
-from warpconvnet.nn.modules.sparse_conv import SparseConv2d
+# --- WarpConvNet specific imports for sparse convolutional ops ---
+from warpconvnet.geometry.types.voxels import Voxels                    # Sparse voxel data structure
+from warpconvnet.nn.functional.transforms import cat                    # Concatenate sparse voxel features
+from warpconvnet.nn.modules.sparse_conv import SparseConv2d             # 2D sparse convolution
 
 from .blocks import (
     ConvBlock2D, ConvTrBlock2D,

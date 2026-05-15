@@ -2,12 +2,25 @@
 """
 Model registry for DUNE neutrino detector classifiers and backbones.
 
-After refactoring:
-- Backbones: pure feature extractors, return [B, 64, 500, 500] dense features
-- Classifiers: backbone + classification head, return [B, 4] class logits
+Backbone naming convention:
+- `MinkUNetSparseAttentionCore` / `MinkUNetTrueMAECore`: Voxels → Voxels sparse cores
+  used directly by Voxels-native pipelines (e.g. MAE pretraining).
+- `MinkUNetSparseAttention*`:                            Tensor → Tensor wrappers
+  (Dense input/output via `FromDense` / `ToDense` boundary layers) for Dense
+  dataloaders, DINO, and the supervised classifier head.
+
+- Backbones: pure feature extractors, return [B, 64, H, W] dense features
+  (or Voxels for the *Core variants).
+- Classifiers: backbone + classification head, return [B, n_classes] class logits.
 """
 
-# ============ Backbone classes (feature extractors only) ============
+# ============ Sparse cores (Voxels → Voxels) ============
+from .minkunet_attention import (
+    MinkUNetSparseAttentionCore,
+    MinkUNetTrueMAECore,
+)
+
+# ============ Backbone classes (Dense Tensor → Dense Tensor) ============
 from .minkunet import MinkUNetSparse
 from .minkunet_attention import (
     MinkUNetSparseAttention,
@@ -40,6 +53,7 @@ MODEL_REGISTRY = {
 }
 
 # ============ BACKBONE_REGISTRY (exposed for DINO and other self-supervised methods) ============
+# Dense Tensor → Dense Tensor backbones (DINO consumes [B,1,H,W] images).
 BACKBONE_REGISTRY = {
     # Backbone with sparse attention
     "attn_default":     MinkUNetSparseAttention,

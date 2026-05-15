@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from warpconvnet.geometry.types.voxels import Voxels
+
 
 class PixelDINOLoss(nn.Module):
     """
@@ -28,13 +30,17 @@ class PixelDINOLoss(nn.Module):
 
     def __init__(
         self,
-        loss_type: str = "cosine",
+        loss_type: str = "dino",
         center_momentum: float = 0.9,
         use_centering: bool = True,
         teacher_temp: float = 1.0,
         student_temp: float = 1.0,
+        normalize_features: bool = True,
         use_cov_penalty: bool = False,
         cov_penalty_weight: float = 1e-3,
+        use_var_penalty: bool = False,
+        var_penalty_weight: float = 1.0,
+        var_gamma: float = 1.0,
     ):
         """
         Args:
@@ -44,9 +50,16 @@ class PixelDINOLoss(nn.Module):
                                  computing the loss; the center buffer is always updated regardless
             teacher_temp:        softmax temperature for teacher logits (only used for "dino")
             student_temp:        softmax temperature for student logits (only used for "dino")
+            normalize_features:  if True, L2-normalise student and teacher features before the
+                                 loss; set to False when a projection head is used (the head's
+                                 internal L2 norm already normalises the features)
             use_cov_penalty:     if True, add a VICReg-style covariance decorrelation penalty on
                                  student features to prevent dimensional collapse
             cov_penalty_weight:  scalar weight for the covariance penalty term (default 1e-3)
+            use_var_penalty:     if True, add a VICReg-style variance penalty on student features
+                                 to prevent dimensional collapse by keeping per-dim std >= var_gamma
+            var_penalty_weight:  scalar weight for the variance penalty term (default 1.0)
+            var_gamma:           target minimum std per feature dimension (default 1.0)
         """
         super().__init__()
         assert loss_type in ("cosine", "mse", "dino"), f"Unknown loss_type: {loss_type}"
@@ -55,47 +68,42 @@ class PixelDINOLoss(nn.Module):
         self.use_centering = use_centering
         self.teacher_temp = teacher_temp
         self.student_temp = student_temp
+        self.normalize_features = normalize_features
         self.use_cov_penalty = use_cov_penalty
         self.cov_penalty_weight = cov_penalty_weight
+        self.use_var_penalty = use_var_penalty
+        self.var_penalty_weight = var_penalty_weight
+        self.var_gamma = var_gamma
         # Lazily initialized on first forward call once feature dim D is known.
         # register_buffer ensures it moves with .to(device) and is saved in checkpoints.
         self.register_buffer("center", None)
 
     def forward(
         self,
-        student_feats: Tensor,  # [B, D, H, W] student output
-        teacher_feats: Tensor,  # [B, D, H, W] teacher output (should be detached)
-        mask: Tensor,           # [B, H, W] bool, True = masked (student didn't see)
-        original_x: Tensor,     # [B, 1, H, W] original (unmodified) image
+        s: Tensor,            # [N_matched, D] pre-aligned student head features
+        s_backbone: Tensor,   # [N_matched, D_bb] pre-aligned student backbone features
+        t: Tensor,            # [N_matched, D] pre-aligned teacher head features
+        counts: Tensor,       # [B] per-image matched voxel counts
     ) -> Tensor:
         """
-        Compute pixel-level DINO loss at unmasked active positions.
+        Compute per-voxel DINO loss on pre-aligned student/teacher features.
+
+        The caller is responsible for spatial matching (by coordinates) and
+        gathering aligned feature pairs.  This method receives flat tensors
+        concatenated over the batch, plus per-image counts for the two-stage
+        (per-image mean, then batch mean) reduction.
 
         Args:
-            student_feats: Student backbone output [B, D, H, W]
-            teacher_feats: Teacher backbone output [B, D, H, W], pre-detached
-            mask: Boolean mask [B, H, W], True where pixels were masked from student
-            original_x: Original image [B, 1, H, W] to identify active pixels
+            s:          [N_matched, D] student features (head output or backbone)
+            s_backbone: [N_matched, D_bb] student backbone features (for cov/var penalty)
+            t:          [N_matched, D] teacher features (detached)
+            counts:     [B] int64 tensor — number of matched voxels per image
 
         Returns:
-            Scalar loss value
+            Scalar loss value, plus diagnostic scalars
         """
-        # Identify active pixels (originally non-zero in the image)
-        active = (original_x.squeeze(1) != 0)  # [B, H, W]
-
-        # Valid positions: active AND not masked (where student computed real features)
-        valid = active & (~mask)  # [B, H, W]
-
-        counts = valid.sum(dim=(1, 2)).float()  # [B] valid pixels per image
-
-        # Handle empty case
-        if counts.sum() == 0:
-            return torch.tensor(0.0, device=student_feats.device, dtype=student_feats.dtype), None, None, None
-
-        # Flatten to valid pixels only — keeps heavy ops (normalize, softmax) efficient
-        # for sparse images where N_valid << B*H*W
-        s = student_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
-        t = teacher_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
+        B      = counts.shape[0]
+        device = s.device
 
         # Lazy-initialize center on first forward call
         if self.center is None:
@@ -115,14 +123,17 @@ class PixelDINOLoss(nn.Module):
         if self.use_centering:
             t = t - self.center
 
-        # For dino loss: L2-normalize to unit sphere so scale-invariant
-        if self.loss_type == "dino":
+        # For dino loss: L2-normalize to unit sphere so scale-invariant.
+        # normalize_features=False skips this when a projection head is used
+        # (the head's internal L2 norm already puts features on the sphere).
+        if self.loss_type == "dino" and self.normalize_features:
             s = F.normalize(s, dim=-1)
             t = F.normalize(t, dim=-1)
 
-        # teacher_entropy_px and kl_px are only set in the dino branch;
-        # initialize to None so they have a defined value for the other loss types.
+        # teacher_entropy_px, student_entropy_px, and kl_px are only set in the dino
+        # branch; initialize to None so they have a defined value for the other loss types.
         teacher_entropy_px = None
+        student_entropy_px = None
         kl_px = None
 
         # Compute per-pixel loss [N_valid]
@@ -139,41 +150,58 @@ class PixelDINOLoss(nn.Module):
             loss = -(t_prob * s_logp).sum(dim=-1)                  # H(P_t, P_s) [N_valid]
 
             # decompose loss into teacher entropy and KL divergence for diagnostics:
+            s_prob = F.softmax(s / self.student_temp, dim=-1)      # [N_valid, D]
             teacher_entropy_px = -(t_prob * t_logp).sum(dim=-1)    # H(P_t)      [N_valid]
+            student_entropy_px = -(s_prob * s_logp).sum(dim=-1)    # H(P_s)      [N_valid]
             kl_px = loss - teacher_entropy_px                      # KL(P_t|P_s)[N_valid]
 
-        # Optional covariance decorrelation penalty on student features
+        # Optional covariance decorrelation penalty on raw backbone features (64-dim).
+        # Computed before the projection head and before L2-normalization so the
+        # penalty sees the actual feature scale and covariance structure.
         cov_penalty = None
         if self.use_cov_penalty:
-            cov_penalty = self._cov_penalty(s)
+            cov_penalty = self._cov_penalty(s_backbone)
+
+        var_penalty = None
+        if self.use_var_penalty:
+            var_penalty = self._var_penalty(s_backbone)
 
         # Two-stage reduction: sum per image via scatter, divide by count, then mean.
         # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
-        B = student_feats.shape[0]
-        batch_idx = torch.where(valid)[0]  # [N_valid] — image index for each valid pixel
+        counts_dev = counts.to(device)
+        batch_idx = torch.repeat_interleave(torch.arange(B, device=device), counts_dev)
         per_image_loss = torch.zeros(B, device=loss.device, dtype=loss.dtype)
         per_image_loss.scatter_add_(0, batch_idx, loss)
-        per_image_loss = per_image_loss / counts.clamp(min=1.0)
-        scalar_loss = per_image_loss[counts > 0].mean()
+        counts_f = counts_dev.float()
+        per_image_loss = per_image_loss / counts_f.clamp(min=1.0)
+        scalar_loss = per_image_loss[counts_f > 0].mean()
 
         if self.use_cov_penalty:
             scalar_loss = scalar_loss + self.cov_penalty_weight * cov_penalty
+        if self.use_var_penalty:
+            scalar_loss = scalar_loss + self.var_penalty_weight * var_penalty
 
         cov_penalty_item = cov_penalty.item() if cov_penalty is not None else None
+        var_penalty_item = var_penalty.item() if var_penalty is not None else None
 
         if teacher_entropy_px is not None:
             per_image_t_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
             per_image_t_ent.scatter_add_(0, batch_idx, teacher_entropy_px)
-            t_ent = (per_image_t_ent / counts.clamp(min=1.0))[counts > 0].mean().item()
+            t_ent = (per_image_t_ent / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
+
+            per_image_s_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
+            per_image_s_ent.scatter_add_(0, batch_idx, student_entropy_px)
+            s_ent = (per_image_s_ent / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
 
             per_image_kl = torch.zeros(B, device=loss.device, dtype=loss.dtype)
             per_image_kl.scatter_add_(0, batch_idx, kl_px)
-            kl = (per_image_kl / counts.clamp(min=1.0))[counts > 0].mean().item()
+            kl = (per_image_kl / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
         else:
             t_ent = None
+            s_ent = None
             kl = None
 
-        return scalar_loss, t_ent, kl, cov_penalty_item
+        return scalar_loss, t_ent, s_ent, kl, cov_penalty_item, var_penalty_item
 
     def _cov_penalty(self, s: Tensor) -> Tensor:
         """
@@ -184,8 +212,7 @@ class PixelDINOLoss(nn.Module):
         across the full feature space.
 
         Args:
-            s: Student features [N, D] (valid pixels only, already centered/normalized
-               by the main loss branch if applicable)
+            s: Raw backbone features [N, D] (valid pixels only, before head and L2-norm)
 
         Returns:
             Scalar penalty: sum of squared off-diagonal covariance entries, divided by D
@@ -199,8 +226,28 @@ class PixelDINOLoss(nn.Module):
         off_diag_sq = C.pow(2).sum() - C.diagonal().pow(2).sum()
         return off_diag_sq / D
 
+    def _var_penalty(self, s: Tensor) -> Tensor:
+        """
+        VICReg-style variance penalty.
+
+        Hinge loss that pushes the per-dimension std (over the batch of voxels) to
+        stay above var_gamma, preventing any single feature dimension from collapsing
+        to a constant.
+
+        Args:
+            s: Raw backbone features [N, D] (valid pixels only, before head and L2-norm)
+
+        Returns:
+            Scalar penalty: mean over dimensions of max(0, gamma - std_j)
+        """
+        N, D = s.shape
+        if N < 2:
+            return s.new_tensor(0.0)
+        std = torch.sqrt(s.var(dim=0) + 1e-4)  # [D], std per feature dimension
+        return torch.mean(torch.clamp(self.var_gamma - std, min=0.0))
+
     @torch.no_grad()
-    def update_center(self, teacher_feats: Tensor, original_x: Tensor) -> None:
+    def update_center(self, teacher_out: Voxels) -> None:
         """
         Update the running center with the EMA of teacher features at active positions.
 
@@ -209,11 +256,9 @@ class PixelDINOLoss(nn.Module):
         eval-mode teacher outputs.
 
         Args:
-            teacher_feats: Teacher backbone output [B, D, H, W], detached
-            original_x: Original (unmasked) image [B, 1, H, W] to identify active pixels
+            teacher_out: Teacher backbone output (Voxels); all voxels are active by definition
         """
-        active = (original_x.squeeze(1) != 0)  # [B, H, W]
-        teacher_flat = teacher_feats.permute(0, 2, 3, 1)[active]  # [N_active, D]
+        teacher_flat = teacher_out.feature_tensor  # [N_active, D]
 
         if teacher_flat.shape[0] == 0:
             return
@@ -224,9 +269,7 @@ class PixelDINOLoss(nn.Module):
         #if self.loss_type == "dino":
         #    teacher_flat = F.normalize(teacher_flat, dim=-1)
 
-        # for each feature, take mean over all active pixels in the batch
-        # result is [D]
-        batch_mean = teacher_flat.mean(dim=0)
+        batch_mean = teacher_flat.mean(dim=0)  # [D]
 
         if self.center is None:
             self.center = batch_mean.clone()

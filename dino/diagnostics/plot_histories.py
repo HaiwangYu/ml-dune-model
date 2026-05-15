@@ -31,18 +31,37 @@ def pr_from_eigen(vals: np.ndarray) -> float:
     return float(v.sum() ** 2 / denom) if denom > 0 else 1.0
 
 
+def infer_feature_dim(data: dict) -> int:
+    """
+    Infer the feature dimension used in the DINO loss from the stored covariance matrices.
+
+    Prefers the head covariance (present when a projection head was used) over the
+    backbone covariance, since the head output is what feeds into the loss.
+    Falls back to 128 if no covariance data is available.
+    """
+    stats = data.get("stats", {})
+    for key in ("s_head_cov_mat", "s_cov_mat"):
+        mats = stats.get(key, [])
+        if mats and mats[0]:
+            return len(mats[0])
+    return 128
+
+
 def plot_loss(data: dict, out_dir: Path):
     loss = data.get("loss", [])
     if not loss:
         return
     val = data.get("val", {})
 
-    # Extract non-null teacher entropy and KL values along with their iteration indices.
+    # Extract non-null teacher/student entropy and KL values along with their iteration indices.
     # Values are null (None after JSON load) for non-dino loss types.
     raw_t_ent = data.get("teacher_entropy", [])
+    raw_s_ent = data.get("student_entropy", [])
     raw_kl    = data.get("kl", [])
     t_ent_iters = [i for i, v in enumerate(raw_t_ent) if v is not None]
     t_ent_vals  = [raw_t_ent[i] for i in t_ent_iters]
+    s_ent_iters = [i for i, v in enumerate(raw_s_ent) if v is not None]
+    s_ent_vals  = [raw_s_ent[i] for i in s_ent_iters]
     kl_iters    = [i for i, v in enumerate(raw_kl) if v is not None]
     kl_vals     = [raw_kl[i] for i in kl_iters]
     has_components = bool(t_ent_vals and kl_vals)
@@ -53,7 +72,14 @@ def plot_loss(data: dict, out_dir: Path):
     cov_vals  = [raw_cov[i] for i in cov_iters]
     has_cov = bool(cov_vals)
 
-    n_rows = 1 + int(has_components) + int(has_cov)
+    # Extract non-null variance penalty values.
+    raw_var = data.get("var_penalty", [])
+    var_iters = [i for i, v in enumerate(raw_var) if v is not None]
+    var_vals  = [raw_var[i] for i in var_iters]
+    has_var = bool(var_vals)
+
+    has_vicreg = has_cov or has_var
+    n_rows = 1 + int(has_components) + int(has_vicreg)
     fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 + 4 * (n_rows - 1)), sharex=False)
     if n_rows == 1:
         axes = [axes]
@@ -76,45 +102,60 @@ def plot_loss(data: dict, out_dir: Path):
     if has_components:
         ax_comp = axes[next_row]
         next_row += 1
-        K = 64  # feature dimension (number of softmax categories)
+        K = infer_feature_dim(data)  # head feature dimension (number of softmax categories)
         h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
         ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
                      color="C2", label="Teacher entropy  H(P_t)")
+        if s_ent_vals:
+            ax_comp.plot(s_ent_iters, s_ent_vals, linewidth=1.0, alpha=0.8,
+                         color="C0", label="Student entropy  H(P_s)")
         ax_comp.plot(kl_iters, kl_vals, linewidth=1.0, alpha=0.8,
                      color="C3", label="KL divergence  KL(P_t|P_s)")
         ax_comp.axhline(h_max, color="C2", linewidth=1.2, linestyle="--", alpha=0.7,
                         label=f"H_max = log({K})")
         ax_comp.set_xlabel("Iteration")
         ax_comp.set_ylabel("Nats")
-        ax_comp.set_title("Loss decomposition: H(P_t, P_s) = H(P_t) + KL(P_t|P_s)")
+        ax_comp.set_title("Loss decomposition: H(P_t, P_s) = H(P_t) + KL(P_t|P_s)  |  H(P_s)")
         #ax_comp.set_yscale("log")
-        ax_comp.legend()
+        ax_comp.legend(loc="upper right")
         ax_comp.grid(True, alpha=0.3)
 
-    if has_cov:
-        ax_cov = axes[next_row]
-        ax_cov.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
-                    color="C4", label="Covariance penalty (raw, unweighted)")
-        ax_cov.set_xlabel("Iteration")
-        ax_cov.set_ylabel("Penalty")
-        ax_cov.set_title("VICReg covariance decorrelation penalty  (low → less dimensional correlation)")
-        ax_cov.legend()
-        ax_cov.grid(True, alpha=0.3)
+    if has_vicreg:
+        ax_reg = axes[next_row]
+        next_row += 1
+        if has_cov:
+            ax_reg.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
+                        color="C0", label="Covariance penalty (raw, unweighted)")
+        if has_var:
+            ax_reg.plot(var_iters, var_vals, linewidth=1.0, alpha=0.8,
+                        color="C1", label="Variance penalty (raw, unweighted)")
+        ax_reg.set_xlabel("Iteration")
+        ax_reg.set_ylabel("Penalty")
+        ax_reg.set_title("VICReg penalties  (cov: low → less correlation | var: low → std above gamma)")
+        ax_reg.legend()
+        ax_reg.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "loss_curve.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "loss_curve.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved loss_curve.png")
 
 
-def plot_stats(data: dict, out_dir: Path):
+def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str = ""):
     h = data.get("stats", {})
     if not h or len(h.get("iter", [])) == 0:
         return
 
+    key_s = f"s_{mat_key}cov_mat" if mat_key else "s_cov_mat"
+    key_t = f"t_{mat_key}cov_mat" if mat_key else "t_cov_mat"
+    raw_s = h.get(key_s, [])
+    raw_t = h.get(key_t, [])
+    if not raw_s or not raw_s[0]:  # head mats are [] when no head was used
+        return
+
     iters = h["iter"]
-    s_mats = [np.array(m) for m in h["s_cov_mat"]]
-    t_mats = [np.array(m) for m in h["t_cov_mat"]]
+    s_mats = [np.array(m) for m in raw_s]
+    t_mats = [np.array(m) for m in raw_t]
 
     s_eigen = compute_eigen(s_mats)
     t_eigen = compute_eigen(t_mats)
@@ -161,86 +202,87 @@ def plot_stats(data: dict, out_dir: Path):
 
     # Row 0: per-pixel L2 norm — median line with min/max band
     for col, (prefix, color, name) in enumerate([
-        ("s_norm", "C0", "Student"), ("t_norm", "C1", "Teacher")
+        (f"s_{mat_key}norm", "C0", "Student"), (f"t_{mat_key}norm", "C1", "Teacher")
     ]):
         ax = axes[0, col]
-        mins    = h[f"{prefix}_min"]
-        maxs    = h[f"{prefix}_max"]
-        medians = h[f"{prefix}_median"]
+        mins    = h.get(f"{prefix}_min",    [])
+        maxs    = h.get(f"{prefix}_max",    [])
+        medians = h.get(f"{prefix}_median", [])
         ax.fill_between(iters, mins, maxs, alpha=0.3, color=color, label="Min–Max")
         ax.plot(iters, medians, linewidth=1.5, color=color, label="Median")
         ax.set_ylabel("Per-pixel L2 norm")
-        ax.set_title(f"{name} feature magnitude  (high → potential divergence)")
+        ax.set_title(f"{name} feature magnitude")
         ax.legend(fontsize=8)
         ax.set_yscale("log")
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
     # Row 1: per-feature variance 2D histogram
-    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", "Student Variance  (low → dimensional collapse)")
-    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", "Teacher Variance  (low → dimensional collapse)")
+    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", f"Student Variance [{label}]")
+    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", f"Teacher Variance [{label}]")
 
     # Row 2: participation ratio (scalar)
-    for col, (pr, label) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
+    for col, (pr, role) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
         ax = axes[2, col]
         ax.plot(iters, pr, linewidth=1.5, color=f"C{col}")
         ax.set_ylabel("Effective rank  [1, D]")
-        ax.set_title(f"{label} Participation Ratio  (low → few dominant channels)")
+        ax.set_title(f"{role} Participation Ratio [{label}]")
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
+    fname = f"feature_stats_{label}.png"
     fig.tight_layout()
-    fig.savefig(out_dir / "feature_stats.png", dpi=300, bbox_inches="tight")
+    fig.savefig(out_dir / fname, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"  saved feature_stats.png")
+    print(f"  saved {fname}")
 
 
-def plot_cov_heatmap(data: dict, out_dir: Path):
+def plot_cov_heatmap(data: dict, out_dir: Path, label: str = "backbone", mat_key: str = ""):
     h = data.get("stats", {})
-    s_mats = h.get("s_cov_mat", [])
-    t_mats = h.get("t_cov_mat", [])
-    if not s_mats:
+    key_s = f"s_{mat_key}cov_mat" if mat_key else "s_cov_mat"
+    key_t = f"t_{mat_key}cov_mat" if mat_key else "t_cov_mat"
+    s_mats = h.get(key_s, [])
+    t_mats = h.get(key_t, [])
+    if not s_mats or not s_mats[0]:
         return
 
     iters = h.get("iter", [])
 
+    def to_corr(mat):
+        std = np.sqrt(np.diag(mat)).clip(1e-8)
+        return mat / np.outer(std, std)
+
     # Pick first and last snapshots (or just one if only one exists)
     snapshots = [(0, "first")] if len(s_mats) == 1 else [(0, "first"), (-1, "last")]
 
-    for idx, label in snapshots:
-        s_cov = np.array(s_mats[idx])
-        t_cov = np.array(t_mats[idx])
-
-        # Normalize to correlation matrix: C[i,j] / sqrt(C[i,i] * C[j,j])
-        def to_corr(mat):
-            std = np.sqrt(np.diag(mat)).clip(1e-8)
-            return mat / np.outer(std, std)
-
-        s_corr = to_corr(s_cov)
-        t_corr = to_corr(t_cov)
+    for idx, snap in snapshots:
+        s_corr = to_corr(np.array(s_mats[idx]))
+        t_corr = to_corr(np.array(t_mats[idx]))
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        title_suffix = f"iter {iters[idx]}" if iters else label
+        title_suffix = f"iter {iters[idx]}" if iters else snap
 
         for ax, corr, name in zip(axes, [s_corr, t_corr], ["Student", "Teacher"]):
             im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdBu_r", aspect="auto")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title(f"{name} feature correlation ({title_suffix})")
+            ax.set_title(f"{name} [{label}] feature correlation ({title_suffix})")
             ax.set_xlabel("Feature index")
             ax.set_ylabel("Feature index")
 
         fig.tight_layout()
-        fname = f"cov_heatmap_{label}.png"
-        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        fname = f"cov_heatmap_{label}_{snap}.png"
+        fig.savefig(out_dir / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
 
 
-def plot_eigen(data: dict, out_dir: Path):
+def plot_eigen(data: dict, out_dir: Path, label: str = "backbone", mat_key: str = ""):
     h = data.get("stats", {})
-    s_mats = h.get("s_cov_mat", [])
-    t_mats = h.get("t_cov_mat", [])
-    if not s_mats:
+    key_s = f"s_{mat_key}cov_mat" if mat_key else "s_cov_mat"
+    key_t = f"t_{mat_key}cov_mat" if mat_key else "t_cov_mat"
+    s_mats = h.get(key_s, [])
+    t_mats = h.get(key_t, [])
+    if not s_mats or not s_mats[0]:
         return
 
     iters = h.get("iter", [])
@@ -249,40 +291,37 @@ def plot_eigen(data: dict, out_dir: Path):
     s_eigen = compute_eigen([np.array(m) for m in s_mats])
     t_eigen = compute_eigen([np.array(m) for m in t_mats])
 
-    for idx, label in snapshots:
+    for idx, snap in snapshots:
         s_cov = np.array(s_mats[idx])
         t_cov = np.array(t_mats[idx])
         s_vals, s_vecs = s_eigen[idx]
         t_vals, t_vecs = t_eigen[idx]
 
-        # Covariance in eigenbasis: V.T @ C @ V = diag(eigenvalues), normalized by largest eigenvalue
         s_cov_eigen = (s_vecs.T @ s_cov @ s_vecs) / s_vals[-1]
         t_cov_eigen = (t_vecs.T @ t_cov @ t_vecs) / t_vals[-1]
 
-        title_suffix = f"iter {iters[idx]}" if iters else label
+        title_suffix = f"iter {iters[idx]}" if iters else snap
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        # Top row: eigenvalue spectra
         for ax, vals, name in zip(axes[0], [s_vals, t_vals], ["Student", "Teacher"]):
             ax.bar(np.arange(len(vals)), vals, width=1.0)
             ax.set_yscale("log")
             ax.set_xlabel("Eigenvalue index (ascending)")
             ax.set_ylabel("Eigenvalue")
-            ax.set_title(f"{name} eigenvalue spectrum ({title_suffix})")
+            ax.set_title(f"{name} [{label}] eigenvalue spectrum ({title_suffix})")
             ax.grid(True, alpha=0.3)
 
-        # Bottom row: covariance heatmap in eigenbasis
         vmax = max(np.abs(s_cov_eigen).max(), np.abs(t_cov_eigen).max())
         for ax, mat, name in zip(axes[1], [s_cov_eigen, t_cov_eigen], ["Student", "Teacher"]):
             im = ax.imshow(mat, vmin=-vmax, vmax=vmax, cmap="RdBu_r", aspect="auto")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title(f"{name} covariance in eigenbasis ({title_suffix})")
+            ax.set_title(f"{name} [{label}] covariance in eigenbasis ({title_suffix})")
             ax.set_xlabel("Eigenvector index")
             ax.set_ylabel("Eigenvector index")
 
         fig.tight_layout()
-        fname = f"eigen_{label}.png"
-        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        fname = f"eigen_{label}_{snap}.png"
+        fig.savefig(out_dir / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
 
@@ -311,7 +350,7 @@ def plot_center_stats(data: dict, out_dir: Path):
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "center_stats.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "center_stats.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved center_stats.png")
 
@@ -383,9 +422,32 @@ def plot_grads(data: dict, out_dir: Path):
 
     fig.suptitle("Gradient Norms per Backbone Module", fontsize=12)
     fig.tight_layout()
-    fig.savefig(out_dir / "grad_norms.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "grad_norms.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved grad_norms.png")
+
+
+def plot_gpu_memory(data: dict, out_dir: Path):
+    h = data.get("gpu_memory", {})
+    iters = h.get("iter", [])
+    alloc = h.get("peak_alloc_gib", [])
+    reserved = h.get("peak_reserved_gib", [])
+    if not iters or not alloc:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(iters, alloc, linewidth=1.5, color="C0", label="Peak allocated")
+    ax.plot(iters, reserved, linewidth=1.5, color="C1", alpha=0.7, label="Peak reserved")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("GiB")
+    ax.set_title("Peak GPU memory per iteration")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "gpu_memory.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved gpu_memory.png")
 
 
 def main():
@@ -406,11 +468,15 @@ def main():
         data = json.load(f)
 
     plot_loss(data, out_dir)
-    plot_stats(data, out_dir)
+    plot_stats(data, out_dir, label="backbone", mat_key="")
+    plot_stats(data, out_dir, label="head", mat_key="head_")
     plot_center_stats(data, out_dir)
-    plot_cov_heatmap(data, out_dir)
-    plot_eigen(data, out_dir)
+    plot_cov_heatmap(data, out_dir, label="backbone", mat_key="")
+    plot_cov_heatmap(data, out_dir, label="head", mat_key="head_")
+    plot_eigen(data, out_dir, label="backbone", mat_key="")
+    plot_eigen(data, out_dir, label="head", mat_key="head_")
     plot_grads(data, out_dir)
+    plot_gpu_memory(data, out_dir)
 
     print("Done.")
 

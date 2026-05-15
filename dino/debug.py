@@ -27,8 +27,10 @@ class DINODebugger:
     History file (histories.json):
     - loss:            [float, ...]                      per-batch train loss
     - teacher_entropy: [float|null, ...]                 per-batch H(P_t)       (dino only, else null)
+    - student_entropy: [float|null, ...]                 per-batch H(P_s)       (dino only, else null)
     - kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
-    - cov_penalty:     [float|null, ...]                 per-batch raw covariance penalty (if enabled, else null)
+    - cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
+    - var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
     - val:    {iter: [...], loss: [...]}         per-epoch val loss
     - stats:  {iter: [...], s_var: [...], ...}  feature statistics
     - grad:   {module: {iter: [...], norm: [...]}, ...}
@@ -37,24 +39,38 @@ class DINODebugger:
     def __init__(self, cfg, enabled: bool = True):
         self.enabled = enabled and cfg.debug
         self.debug_every = cfg.debug_every
-        self.debug_dir = Path(cfg.debug_dir) if self.enabled else None
+        # debug_dir is always set so run_config.json can be written unconditionally;
+        # the verbose logger / history accumulation below is still gated on self.enabled.
+        self.debug_dir = Path(cfg.debug_dir)
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.logger = None
         self.loss_history = [] if self.enabled else None
         self.teacher_entropy_history = [] if self.enabled else None
+        self.student_entropy_history = [] if self.enabled else None
         self.kl_history = [] if self.enabled else None
         self.cov_penalty_history = [] if self.enabled else None
+        self.var_penalty_history = [] if self.enabled else None
 
         # Histories for offline plotting
         self.stats_history = (
             {"iter": [],
              "s_norm_min": [], "s_norm_max": [], "s_norm_median": [],
              "t_norm_min": [], "t_norm_max": [], "t_norm_median": [],
+             "s_head_norm_min": [], "s_head_norm_max": [], "s_head_norm_median": [],
+             "t_head_norm_min": [], "t_head_norm_max": [], "t_head_norm_median": [],
              "s_cov_mat": [], "t_cov_mat": [],
+             "s_head_cov_mat": [], "t_head_cov_mat": [],
              "center_norm": [], "center_var": []}
             if self.enabled else None
         )
         # grad_history: module_group -> {"iter": [...], "norm": [...]}
         self.grad_history = {} if self.enabled else None
+        self.last_peak_alloc_gib: float = 0.0
+        # gpu_memory_history: per-iteration peak allocated/reserved GiB
+        self.gpu_memory_history = (
+            {"iter": [], "peak_alloc_gib": [], "peak_reserved_gib": []}
+            if self.enabled else None
+        )
         # cached norm-module prefixes, built once on first log_gradient_norms call
         self._norm_prefixes: tuple | None = None
         # val_history: iteration index at end of each epoch -> val loss
@@ -62,8 +78,6 @@ class DINODebugger:
 
         if not self.enabled:
             return
-
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
 
         self.logger = logging.getLogger("dino_debug")
         self.logger.setLevel(logging.INFO)
@@ -79,13 +93,17 @@ class DINODebugger:
     # ------------------------------------------------------------------
 
     def log_config(self, cfg):
-        """Log config summary and save run_config.json for experiment tracking."""
-        if not self.enabled or self.logger is None:
-            return
-        self.logger.info(
-            f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
-            f"loss_type={cfg.loss_type}, lr={cfg.lr}, epochs={cfg.epochs}"
-        )
+        """Log config summary and save run_config.json for experiment tracking.
+
+        run_config.json is always written (debug or not) so every run dir has
+        an authoritative record of what main() was called with. The verbose
+        logger.info call only fires when debug logging is enabled.
+        """
+        if self.logger is not None:
+            self.logger.info(
+                f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
+                f"loss_type={cfg.loss_type}, lr={cfg.lr}, epochs={cfg.epochs}"
+            )
         config_dict = {
             "timestamp": datetime.now().isoformat(),
             "run_name": getattr(cfg, "run_name", ""),
@@ -94,13 +112,13 @@ class DINODebugger:
         with open(self.debug_dir / "run_config.json", "w") as f:
             json.dump(config_dict, f, indent=2)
 
-    def log_shapes(self, x, x_student, mask, s_feats, t_feats):
+    def log_shapes(self, x: Tensor, s_feats: Tensor, t_feats: Tensor):
         """Log tensor shapes on first batch."""
         if not self.enabled or self.logger is None:
             return
         self.logger.info(
-            f"Shapes: x={tuple(x.shape)}, x_student={tuple(x_student.shape)}, "
-            f"mask={tuple(mask.shape)}, s_feats={tuple(s_feats.shape)}, "
+            f"Shapes: x={tuple(x.shape)}, "
+            f"s_feats={tuple(s_feats.shape)}, "
             f"t_feats={tuple(t_feats.shape)}"
         )
 
@@ -118,17 +136,21 @@ class DINODebugger:
         lr: float,
         momentum: float,
         teacher_entropy: float | None = None,
+        student_entropy: float | None = None,
         kl: float | None = None,
         cov_penalty: float | None = None,
+        var_penalty: float | None = None,
     ):
         """Log per-batch scalar information (every batch)."""
         if not self.enabled or self.logger is None:
             return
         extra = ""
         if teacher_entropy is not None and kl is not None:
-            extra = f" teacher_entropy={teacher_entropy:.6f} kl={kl:.6f}"
+            extra = f" teacher_entropy={teacher_entropy:.6f} student_entropy={student_entropy:.6f} kl={kl:.6f}"
         if cov_penalty is not None:
             extra += f" cov_penalty={cov_penalty:.6f}"
+        if var_penalty is not None:
+            extra += f" var_penalty={var_penalty:.6f}"
         self.logger.info(
             f"[epoch {epoch:3d} batch {batch_idx:4d} iter {iteration:6d}] "
             f"loss={loss:.6f} n_valid={n_valid} lr={lr:.2e} momentum={momentum:.6f}{extra}"
@@ -137,10 +159,14 @@ class DINODebugger:
             self.loss_history.append(loss)
         if self.teacher_entropy_history is not None:
             self.teacher_entropy_history.append(teacher_entropy)
+        if self.student_entropy_history is not None:
+            self.student_entropy_history.append(student_entropy)
         if self.kl_history is not None:
             self.kl_history.append(kl)
         if self.cov_penalty_history is not None:
             self.cov_penalty_history.append(cov_penalty)
+        if self.var_penalty_history is not None:
+            self.var_penalty_history.append(var_penalty)
 
     def log_val_epoch(self, epoch: int, iteration: int, val_loss: float):
         """
@@ -164,26 +190,32 @@ class DINODebugger:
         JSON structure:
           loss:            [float, ...]                      per-batch train loss
           teacher_entropy: [float|null, ...]                 per-batch H(P_t)       (dino only, else null)
+          student_entropy: [float|null, ...]                 per-batch H(P_s)       (dino only, else null)
           kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
-          cov_penalty:     [float|null, ...]                 per-batch raw covariance penalty (if enabled, else null)
+          cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
+          var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
           val:             {iter: [...], loss: [...]}        per-epoch val loss
           stats:           {iter: [...], s_var: [...], ...}  feature statistics
           grad:            {module: {iter: [...], norm: [...]}, ...}
+          gpu_memory:      {iter: [...], peak_alloc_gib: [...], peak_reserved_gib: [...]}
         """
         if not self.enabled:
             return
         data = {
             "loss":             self.loss_history             or [],
             "teacher_entropy":  self.teacher_entropy_history  or [],
+            "student_entropy":  self.student_entropy_history  or [],
             "kl":               self.kl_history               or [],
             "cov_penalty":      self.cov_penalty_history      or [],
+            "var_penalty":      self.var_penalty_history      or [],
             "val":              self.val_history               or {},
             "stats":            self.stats_history             or {},
             "grad":             self.grad_history              or {},
+            "gpu_memory":       self.gpu_memory_history        or {},
         }
         try:
             with open(self.debug_dir / "histories.json", "w") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f, indent=1)
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error saving histories: {e}")
@@ -191,19 +223,19 @@ class DINODebugger:
     def log_feature_stats(
         self,
         iteration: int,
-        s_feats: Tensor,
-        t_feats: Tensor,
-        mask: Tensor,
-        x: Tensor,
+        s_feats: Tensor,                  # [N_student, D_backbone] raw backbone features
+        t_feats: Tensor,                  # [N_teacher, D_backbone] raw backbone features
+        s_head_feats: Tensor | None = None,  # [N_student, D_head] head output (if head present)
+        t_head_feats: Tensor | None = None,  # [N_teacher, D_head] head output (if head present)
     ):
         """
-        Compute and log representation-quality statistics at valid pixels.
+        Compute and log representation-quality statistics.
 
-        Valid pixels = active (non-zero in original image) AND unmasked
-        (positions the student actually processed).
+        s_feats / t_feats are the raw 64-dim backbone feature tensors.
+        s_head_feats / t_head_feats are the optional projection head outputs (e.g. 128-dim).
 
-        Computed for both student and teacher. Runs every `debug_every` iterations.
-        Full covariance matrices (64×64) are saved to history for offline heatmap plotting.
+        Runs every `debug_every` iterations. Covariance matrices for both backbone and
+        head (when present) are saved to history for offline heatmap/eigenvalue plotting.
         """
         if not self.enabled or self.logger is None:
             return
@@ -211,25 +243,25 @@ class DINODebugger:
             return
 
         with torch.no_grad():
-            active = (x.squeeze(1) != 0)           # [B, H, W]
-            valid = active & (~mask)                # [B, H, W]
+            s_flat = s_feats.detach().float()  # [N_student, D]
+            t_flat = t_feats.detach().float()  # [N_teacher, D]
 
-            # [N_valid, D] — use float32 for numerical stability
-            # first permute [B, D, H, W] to [B, H, W, D] 
-            # then apply valid mask [B, H, W] and flatten to [N_valid, D]
-            s_flat = s_feats.detach().permute(0, 2, 3, 1)[valid].float()
-            t_flat = t_feats.detach().permute(0, 2, 3, 1)[valid].float()
+            s_head_flat = s_head_feats.detach().float() if s_head_feats is not None else None
+            t_head_flat = t_head_feats.detach().float() if t_head_feats is not None else None
 
             if s_flat.shape[0] < 2:
                 return
 
-            # make [N_valid, D] into [D, N_valid] with .T
             s_cov_mat = torch.cov(s_flat.T)   # [D, D]
             t_cov_mat = torch.cov(t_flat.T)
 
-            # L2 norm of the feature vector at each valid pixel [N_valid]
             s_norms = s_flat.norm(dim=-1)
             t_norms = t_flat.norm(dim=-1)
+
+            s_head_cov   = torch.cov(s_head_flat.T) if s_head_flat is not None else None
+            t_head_cov   = torch.cov(t_head_flat.T) if t_head_flat is not None else None
+            s_head_norms = s_head_flat.norm(dim=-1)  if s_head_flat is not None else None
+            t_head_norms = t_head_flat.norm(dim=-1)  if t_head_flat is not None else None
 
         self.logger.info(
             f"[iter {iteration:6d}] FEAT_STATS: "
@@ -244,8 +276,16 @@ class DINODebugger:
         h["t_norm_min"].append(t_norms.min().item())
         h["t_norm_max"].append(t_norms.max().item())
         h["t_norm_median"].append(t_norms.median().item())
+        h["s_head_norm_min"].append(s_head_norms.min().item()    if s_head_norms is not None else float("nan"))
+        h["s_head_norm_max"].append(s_head_norms.max().item()    if s_head_norms is not None else float("nan"))
+        h["s_head_norm_median"].append(s_head_norms.median().item() if s_head_norms is not None else float("nan"))
+        h["t_head_norm_min"].append(t_head_norms.min().item()    if t_head_norms is not None else float("nan"))
+        h["t_head_norm_max"].append(t_head_norms.max().item()    if t_head_norms is not None else float("nan"))
+        h["t_head_norm_median"].append(t_head_norms.median().item() if t_head_norms is not None else float("nan"))
         h["s_cov_mat"].append(s_cov_mat.cpu().tolist())
         h["t_cov_mat"].append(t_cov_mat.cpu().tolist())
+        h["s_head_cov_mat"].append(s_head_cov.cpu().tolist() if s_head_cov is not None else [])
+        h["t_head_cov_mat"].append(t_head_cov.cpu().tolist() if t_head_cov is not None else [])
 
     def log_center_stats(self, iteration: int, loss_fn) -> None:
         """
@@ -323,6 +363,22 @@ class DINODebugger:
             if data["iter"] and data["iter"][-1] == iteration
         )
         self.logger.info(f"[iter {iteration:6d}] GRAD_NORMS: {msg}")
+
+    def log_gpu_memory(self, iteration: int):
+        """Log peak GPU memory (allocated and reserved) since last call, then reset the peak counter."""
+        if not self.enabled or not torch.cuda.is_available():
+            return
+        alloc_gib = torch.cuda.max_memory_allocated() / 1024**3
+        reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
+        self.last_peak_alloc_gib = alloc_gib
+        torch.cuda.reset_peak_memory_stats()
+        self.logger.info(
+            f"[iter {iteration:6d}] GPU_MEM: peak_alloc={alloc_gib:.2f} GiB  peak_reserved={reserved_gib:.2f} GiB"
+        )
+        h = self.gpu_memory_history
+        h["iter"].append(iteration)
+        h["peak_alloc_gib"].append(alloc_gib)
+        h["peak_reserved_gib"].append(reserved_gib)
 
     def maybe_save_histories(self, iteration: int):
         """Persist histories to disk every `debug_every` iterations."""
