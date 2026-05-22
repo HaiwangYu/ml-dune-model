@@ -4,5 +4,12 @@ checkpoints*
 metrics
 viz*
 run_*
+*.err
+*.log
+*.out
 *.swp
+*.sub
+*.sh
+*.json
+.claude
 debug

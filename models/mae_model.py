@@ -101,6 +101,131 @@ def expm1_voxels(vox: Voxels) -> Voxels:
 # Sparse CNN classification head
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pixel-level PID class mapping
+# ---------------------------------------------------------------------------
+
+PIXEL_PID_CLASS_NAMES = ["track", "shower", "other"]
+PIXEL_PID_N_CLASSES = len(PIXEL_PID_CLASS_NAMES)
+_PIXEL_PID_IGNORE = -1   # used as ignore_index in cross-entropy
+
+_TRACK_PDGS = {13, -13, 2212, 211, -211}    # μ, p, π±
+_ELEC_PDGS  = {11, -11}                       # e±
+_GAMMA_PDG  = 22
+
+_BLIP_CONNECT_DIST = 5.0
+_BLIP_MAX_PIXELS   = 30
+
+
+def pdg_to_pixel_class(
+    pid_labels,            # np.ndarray[N] int32 raw PDG codes (0 = no truth)
+    positions,             # np.ndarray[N, 2] int32 (channel, tick) — same image only
+    connect_dist: float = _BLIP_CONNECT_DIST,
+    blip_max_pixels: int = _BLIP_MAX_PIXELS,
+):
+    """
+    Map per-voxel PDG codes to pixel-PID class indices for a SINGLE image.
+
+    Classes:
+      0 = track   (μ±, proton, π±)
+      1 = shower  (e±, shower-γ)
+      2 = other   (blip-γ, everything else)
+     -1 = no truth (pdg == 0) — caller should pass to CE as ignore_index
+
+    Gamma pixels (PDG 22) are split into shower vs blip via connected-component
+    analysis over the (γ + e±) pixels in this image: small clusters
+    (<= blip_max_pixels) → blip → other; larger clusters → shower.
+
+    Returns
+    -------
+    np.ndarray[N] int64
+    """
+    import numpy as np
+    from scipy.spatial import cKDTree
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    pdg = pid_labels.astype(np.int32, copy=False)
+    n = len(pdg)
+    out = np.full(n, 2, dtype=np.int64)   # default → other (2)
+
+    out[np.isin(pdg, list(_TRACK_PDGS))] = 0   # track
+    out[np.isin(pdg, list(_ELEC_PDGS))]  = 1   # shower (e±)
+
+    gamma_local = np.where(pdg == _GAMMA_PDG)[0]
+    if len(gamma_local) > 0:
+        elec_local = np.where(np.isin(pdg, list(_ELEC_PDGS)))[0]
+        em_local   = np.concatenate([gamma_local, elec_local])
+        em_pos     = positions[em_local].astype(float)
+        n_em       = len(em_local)
+
+        if n_em == 1:
+            # single gamma pixel → blip → other
+            out[gamma_local[0]] = 2
+        else:
+            tree  = cKDTree(em_pos)
+            pairs = tree.query_pairs(connect_dist)
+            if pairs:
+                ra, ca = zip(*pairs)
+                ra, ca = list(ra), list(ca)
+                r = ra + ca
+                c = ca + ra
+                adj = csr_matrix(
+                    (np.ones(len(r), dtype=np.float32), (r, c)),
+                    shape=(n_em, n_em),
+                )
+            else:
+                adj = csr_matrix((n_em, n_em), dtype=np.float32)
+            _, comp = connected_components(adj, directed=False)
+            unique, counts = np.unique(comp, return_counts=True)
+            comp_size = dict(zip(unique.tolist(), counts.tolist()))
+            n_gamma = len(gamma_local)
+            for local_i, ci in zip(gamma_local, comp[:n_gamma]):
+                if comp_size[ci] <= blip_max_pixels:
+                    out[local_i] = 2   # blip → other
+                else:
+                    out[local_i] = 1   # shower γ
+
+    out[pdg == 0] = _PIXEL_PID_IGNORE
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Sparse heads
+# ---------------------------------------------------------------------------
+
+class SparsePixelHead(nn.Module):
+    """
+    Pointwise sparse classification head.  No spatial mixing — three 1×1
+    sparse convolutions (in_ch → 128 → 128 → n_classes), then return the
+    raw feature tensor as per-voxel logits.
+
+    Output is a Tensor of shape [N_total, n_classes] (one logit row per
+    active voxel, in the same row order as the input Voxels).
+
+    Parameters
+    ----------
+    in_ch     : input feature channels (64 for backbone output, 1 for raw charge)
+    n_classes : number of output classes
+    """
+
+    def __init__(self, in_ch: int = 64, n_classes: int = 3):
+        super().__init__()
+        self.conv1 = SparseConv2d(in_ch, 128, kernel_size=1, bias=False)
+        self.bn1   = nn.BatchNorm1d(128)
+        self.conv2 = SparseConv2d(128, 128, kernel_size=1, bias=False)
+        self.bn2   = nn.BatchNorm1d(128)
+        self.conv3 = SparseConv2d(128, n_classes, kernel_size=1, bias=True)
+
+    def forward(self, vox: Voxels) -> Tensor:
+        vox = self.conv1(vox)
+        vox = _replace_features(vox, F.relu(self.bn1(vox.feature_tensor)))
+        vox = self.conv2(vox)
+        vox = _replace_features(vox, F.relu(self.bn2(vox.feature_tensor)))
+        vox = self.conv3(vox)
+        return vox.feature_tensor          # [N_total, n_classes]
+
+
 class SparseCNNHead(nn.Module):
     """
     Sparse CNN classification head.
@@ -158,10 +283,10 @@ class SparseMAEModel(nn.Module):
 
     Components
     ----------
-    backbone           : MinkUNetSparseAttentionCore  (Voxels[1 ch] → Voxels[64 ch])
-    charge_head        : 1×1 SparseConv2d(64→1)       SSL reconstruction head
-    nu_flavor_head     : SparseCNNHead(in_ch=64)       SFT head on backbone features
-    ref_nu_flavor_head : SparseCNNHead(in_ch=1)        SFT reference on raw charge
+    backbone            : MinkUNetSparseAttentionCore  (Voxels[1 ch] → Voxels[64 ch])
+    charge_head         : 1×1 SparseConv2d(64→1)       SSL reconstruction head
+    pixel_pid_head      : SparsePixelHead(in_ch=64)    SFT pixel-PID head on backbone features
+    ref_pixel_pid_head  : SparsePixelHead(in_ch=1)     SFT reference on raw charge
 
     Usage
     -----
@@ -172,15 +297,15 @@ class SparseMAEModel(nn.Module):
 
     SFT training (backbone frozen):
         model.freeze_backbone()
-        logits     = model.forward_sft(voxels)      # uses backbone features
-        logits_ref = model.forward_sft_ref(voxels)  # uses raw 1-ch charge
-        loss   = F.cross_entropy(logits[valid], labels[valid])
+        logits     = model.forward_sft(voxels)      # [N_total, n_classes]
+        logits_ref = model.forward_sft_ref(voxels)  # [N_total, n_classes]
+        loss = F.cross_entropy(logits, pixel_targets, ignore_index=-1)
         model.unfreeze_backbone()
     """
 
     def __init__(
         self,
-        n_classes: int = 3,
+        n_classes: int = PIXEL_PID_N_CLASSES,
         spatial_encoding: bool = True,
         flash_attention:  bool = True,
         encoding_dim:     int  = 32,
@@ -202,11 +327,11 @@ class SparseMAEModel(nn.Module):
         # Used in patch-MAE mode to reconstruct local point geometry (PoLAr-MAE).
         self.coord_head = SparseConv2d(64, 2, kernel_size=1, bias=True)
 
-        # SFT head on backbone features (64 ch)
-        self.nu_flavor_head = SparseCNNHead(in_ch=64, n_classes=n_classes)
+        # SFT pixel-PID head on backbone features (64 ch)
+        self.pixel_pid_head = SparsePixelHead(in_ch=64, n_classes=n_classes)
 
-        # Reference SFT head on raw 1-ch charge (no backbone)
-        self.ref_nu_flavor_head = SparseCNNHead(in_ch=1, n_classes=n_classes)
+        # Reference SFT pixel-PID head on raw 1-ch charge (no backbone)
+        self.ref_pixel_pid_head = SparsePixelHead(in_ch=1, n_classes=n_classes)
 
     # ------------------------------------------------------------------ #
 
@@ -222,26 +347,18 @@ class SparseMAEModel(nn.Module):
 
     def forward_sft(self, voxels: Voxels) -> Tensor:
         """
-        Forward pass for SFT using backbone features.
+        Forward pass for SFT using backbone features.  Backbone runs under
+        torch.no_grad() for memory efficiency.
 
-        Backbone runs under torch.no_grad() for memory efficiency.
-        Call freeze_backbone() before this to also prevent grad accumulation.
-
-        Input  : Voxels with 1 feature channel
-        Output : [B, n_classes] logits
+        Output : [N_total, n_classes] per-voxel logits
         """
         with torch.no_grad():
-            feats = self.backbone(voxels)   # Voxels [64 ch]
-        return self.nu_flavor_head(feats)   # [B, n_classes]
+            feats = self.backbone(voxels)
+        return self.pixel_pid_head(feats)
 
     def forward_sft_ref(self, voxels: Voxels) -> Tensor:
-        """
-        Forward pass for reference SFT using raw 1-ch charge (no backbone).
-
-        Input  : Voxels with 1 feature channel
-        Output : [B, n_classes] logits
-        """
-        return self.ref_nu_flavor_head(voxels)  # [B, n_classes]
+        """Reference SFT on raw 1-ch charge.  Returns [N_total, n_classes]."""
+        return self.ref_pixel_pid_head(voxels)
 
     # ------------------------------------------------------------------ #
 
@@ -268,10 +385,10 @@ class SparseMAEModel(nn.Module):
         the current backbone features and raw charge from a clean slate,
         giving an unbiased comparison at each SSL checkpoint.
         """
-        for m in self.nu_flavor_head.modules():
+        for m in self.pixel_pid_head.modules():
             if hasattr(m, 'reset_parameters'):
                 m.reset_parameters()
-        for m in self.ref_nu_flavor_head.modules():
+        for m in self.ref_pixel_pid_head.modules():
             if hasattr(m, 'reset_parameters'):
                 m.reset_parameters()
 
@@ -291,10 +408,10 @@ class SparseTrueMAEModel(nn.Module):
 
     Components
     ----------
-    backbone           : MinkUNetTrueMAECore  (C_visible, C_union → C_union [64ch])
-    charge_head        : 1×1 SparseConv2d(64→1)   SSL reconstruction head
-    nu_flavor_head     : SparseCNNHead(in_ch=64)   SFT head on backbone features
-    ref_nu_flavor_head : SparseCNNHead(in_ch=1)    SFT reference on raw charge
+    backbone            : MinkUNetTrueMAECore  (C_visible, C_union → C_union [64ch])
+    charge_head         : 1×1 SparseConv2d(64→1)   SSL reconstruction head
+    pixel_pid_head      : SparsePixelHead(in_ch=64) SFT pixel-PID head on backbone features
+    ref_pixel_pid_head  : SparsePixelHead(in_ch=1)  SFT reference on raw charge
 
     SSL usage:
         vox_visible, mask_bool = sparse_block_mask_visible(vox, ...)
@@ -303,12 +420,12 @@ class SparseTrueMAEModel(nn.Module):
 
     SFT usage (no masking):
         model.freeze_backbone()
-        logits = model.forward_sft(vox)
+        logits = model.forward_sft(vox)   # [N_total, n_classes] per-voxel
     """
 
     def __init__(
         self,
-        n_classes:        int   = 3,
+        n_classes:        int   = PIXEL_PID_N_CLASSES,
         spatial_encoding: bool  = True,
         flash_attention:  bool  = True,
         encoding_dim:     int   = 32,
@@ -323,8 +440,8 @@ class SparseTrueMAEModel(nn.Module):
         )
         self.charge_head        = SparseConv2d(64, 1, kernel_size=1, bias=True)
         self.coord_head         = SparseConv2d(64, 2, kernel_size=1, bias=True)
-        self.nu_flavor_head     = SparseCNNHead(in_ch=64, n_classes=n_classes)
-        self.ref_nu_flavor_head = SparseCNNHead(in_ch=1,  n_classes=n_classes)
+        self.pixel_pid_head     = SparsePixelHead(in_ch=64, n_classes=n_classes)
+        self.ref_pixel_pid_head = SparsePixelHead(in_ch=1,  n_classes=n_classes)
 
     def forward_ssl(self, vox_visible: Voxels, vox_union: Voxels) -> Voxels:
         """
@@ -345,14 +462,17 @@ class SparseTrueMAEModel(nn.Module):
         return self.charge_head(feats)                   # [N_union, 1]
 
     def forward_sft(self, voxels: Voxels) -> Tensor:
-        """SFT forward using backbone features (no masking; visible == union)."""
+        """SFT forward using backbone features (no masking; visible == union).
+
+        Returns [N_total, n_classes] per-voxel logits.
+        """
         with torch.no_grad():
             feats = self.backbone(voxels, voxels)
-        return self.nu_flavor_head(feats)
+        return self.pixel_pid_head(feats)
 
     def forward_sft_ref(self, voxels: Voxels) -> Tensor:
-        """SFT reference forward on raw 1-ch charge (no backbone)."""
-        return self.ref_nu_flavor_head(voxels)
+        """SFT reference on raw 1-ch charge.  Returns [N_total, n_classes]."""
+        return self.ref_pixel_pid_head(voxels)
 
     def freeze_backbone(self):
         self.backbone.requires_grad_(False)
@@ -363,9 +483,9 @@ class SparseTrueMAEModel(nn.Module):
         self.backbone.train()
 
     def reset_sft_head(self):
-        for m in self.nu_flavor_head.modules():
+        for m in self.pixel_pid_head.modules():
             if hasattr(m, 'reset_parameters'):
                 m.reset_parameters()
-        for m in self.ref_nu_flavor_head.modules():
+        for m in self.ref_pixel_pid_head.modules():
             if hasattr(m, 'reset_parameters'):
                 m.reset_parameters()

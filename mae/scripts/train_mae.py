@@ -36,8 +36,11 @@ Usage
   python mae/scripts/train_mae.py --epochs=50 --batch_size=32
 """
 
+import inspect
+import json
 import sys
 import logging
+from dataclasses import asdict
 from pathlib import Path
 
 import fire
@@ -79,12 +82,18 @@ def _least_occupied_cuda_device() -> torch.device:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))          # mae/
 
-from models.mae_model import SparseMAEModel, SparseTrueMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
+from models.mae_model import (
+    SparseMAEModel, SparseTrueMAEModel,
+    voxels_to_device, log1p_voxels, expm1_voxels,
+    PIXEL_PID_CLASS_NAMES, PIXEL_PID_N_CLASSES,
+)
 from models.sparse_masking import sparse_block_mask, sparse_block_mask_visible, sparse_patch_mask_visible
 from loader.apa_sparse_dataset import APASparseDataset
-from loader.apa_sparse_meta_dataset import APASparseMetaDataset, CLASS_NAMES
-from loader.collate import voxels_collate_fn, voxels_label_collate_fn
-from debug import MAEDebugger
+from loader.apa_sparse_meta_dataset import APASparseMetaDataset
+from loader.sft_pixel_pid_dataset import SFTPixelPIDDataset
+from loader.collate import voxels_collate_fn, voxels_pixel_label_collate_fn
+from mae.config import MAEConfig
+from mae.debug import MAEDebugger
 
 
 # ---------------------------------------------------------------------------
@@ -456,50 +465,55 @@ def _train_sft_epoch(
     device, n_classes, epoch, sft_epoch,
     focal_gamma: float = 2.0,
 ):
+    """Pixel-level PID SFT epoch.
+
+    sft_loader is expected to yield (Voxels, pixel_labels: LongTensor[N_total])
+    where pixel_labels carries the per-voxel class index (or -1 to ignore).
+    """
     model.freeze_backbone()
     sft_losses, ref_losses = [], []
     confusion_sft = torch.zeros(n_classes, n_classes, dtype=torch.long)
     confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
 
-    for step, (vox_sft_cpu, labels) in enumerate(sft_loader):
-        vox_sft = log1p_voxels(voxels_to_device(vox_sft_cpu, device))
-        labels  = labels.to(device)
+    for step, (vox_sft_cpu, pix_labels) in enumerate(sft_loader):
+        vox_sft   = log1p_voxels(voxels_to_device(vox_sft_cpu, device))
+        pix_labels = pix_labels.to(device)
 
-        valid = labels >= 0
-        if not valid.any() or vox_sft.feature_tensor.shape[0] == 0:
+        if vox_sft.feature_tensor.shape[0] == 0:
+            continue
+        valid = pix_labels >= 0
+        if not valid.any():
             continue
 
-        trues = labels[valid].cpu()
-
-        # ── SSL feature head ──────────────────────────────────────────────
-        logits = model.forward_sft(vox_sft)
-        # Guard: strided sparse convs can drop empty batch items from offsets,
-        # making logits.shape[0] < labels.shape[0].  Skip the batch if so.
-        if logits.shape[0] != labels.shape[0]:
+        # ── SSL feature head (per-pixel logits) ───────────────────────────
+        logits = model.forward_sft(vox_sft)              # [N_total, n_classes]
+        if logits.shape[0] != pix_labels.shape[0]:
             continue
-        sft_loss = focal_loss(logits[valid], labels[valid], gamma=focal_gamma)
+        sft_loss = focal_loss(logits[valid], pix_labels[valid], gamma=focal_gamma)
         opt_sft.zero_grad()
         sft_loss.backward()
         opt_sft.step()
         sft_losses.append(sft_loss.item())
-        preds = logits[valid].argmax(dim=1).cpu()
-        for t, p in zip(trues.tolist(), preds.tolist()):
-            if 0 <= t < n_classes and 0 <= p < n_classes:
-                confusion_sft[t, p] += 1
+        preds = logits[valid].argmax(dim=1)
+        confusion_sft += torch.bincount(
+            pix_labels[valid] * n_classes + preds,
+            minlength=n_classes * n_classes,
+        ).reshape(n_classes, n_classes).cpu()
 
-        # ── Raw-charge reference head ─────────────────────────────────────
+        # ── Raw-charge reference head (per-pixel logits) ──────────────────
         logits_ref = model.forward_sft_ref(vox_sft)
-        if logits_ref.shape[0] != labels.shape[0]:
+        if logits_ref.shape[0] != pix_labels.shape[0]:
             continue
-        ref_loss = focal_loss(logits_ref[valid], labels[valid], gamma=focal_gamma)
+        ref_loss = focal_loss(logits_ref[valid], pix_labels[valid], gamma=focal_gamma)
         opt_ref.zero_grad()
         ref_loss.backward()
         opt_ref.step()
         ref_losses.append(ref_loss.item())
-        preds_ref = logits_ref[valid].argmax(dim=1).cpu()
-        for t, p in zip(trues.tolist(), preds_ref.tolist()):
-            if 0 <= t < n_classes and 0 <= p < n_classes:
-                confusion_ref[t, p] += 1
+        preds_ref = logits_ref[valid].argmax(dim=1)
+        confusion_ref += torch.bincount(
+            pix_labels[valid] * n_classes + preds_ref,
+            minlength=n_classes * n_classes,
+        ).reshape(n_classes, n_classes).cpu()
 
         if (step + 1) % 50 == 0:
             sft_mean  = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
@@ -511,8 +525,8 @@ def _train_sft_epoch(
             print(
                 f"  [SFT] SSL-epoch {epoch}  SFT-epoch {sft_epoch}"
                 f"  step [{step + 1}/{len(sft_loader)}]"
-                f"  SSL-feat: loss={sft_mean:.4f} acc={acc_s:.1f}%"
-                f"  | raw-charge: loss={ref_mean:.4f} acc={acc_r:.1f}%"
+                f"  SSL-feat: loss={sft_mean:.4f} pixel-acc={acc_s:.1f}%"
+                f"  | raw-charge: loss={ref_mean:.4f} pixel-acc={acc_r:.1f}%"
             )
 
     model.unfreeze_backbone()
@@ -525,6 +539,7 @@ def _train_sft_epoch(
 
 def main(
     data_root                  = "/nfs/data/1/yuhw/cffm-data/prod-jay-1M-2026-02-27",
+    sft_data_root              = "",     # if empty, SFT reuses data_root
     apa                        = 0,
     view                       = "W",
     batch_size                 = 16,
@@ -536,7 +551,7 @@ def main(
     masking_frac               = 0.5,
     win_ch                     = 30,
     win_tick                   = 50,
-    n_classes                  = 3,
+    n_classes                  = PIXEL_PID_N_CLASSES,   # pixel-PID classes (track, shower, other)
     focal_gamma                = 2.0,  # focal loss gamma; 0 = plain cross-entropy
     ssl_subset_frac            = 1.0,  # fraction of SSL dataset to use
     sft_subset_frac            = 1.0,  # fraction of SFT dataset to use
@@ -559,8 +574,43 @@ def main(
     lambda_coord               = 1.0,   # weight for Chamfer coordinate loss
     lambda_charge              = 1.0,   # weight for charge reconstruction loss (patch-MAE mode)
     resume                     = None,   # path to checkpoint to resume from
+    run_name                   = "",     # optional label; nests outputs under run_name/ if set
+    cache_dir                  = "./data",  # dataset index .pt cache directory (persist across jobs)
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
+    # If a run name is given, nest outputs under <base>/<run_name>/
+    if run_name:
+        checkpoints_dir = f"{checkpoints_dir}/{run_name}"
+        debug_dir       = f"{debug_dir}/{run_name}"
+        viz_dir         = f"{viz_dir}/{run_name}"
+
+    # Persist a MAEConfig snapshot for offline reproducibility / from_config reload.
+    Path(debug_dir).mkdir(parents=True, exist_ok=True)
+    cfg = MAEConfig(**{
+        k: v for k, v in {
+            "run_name": run_name, "data_root": data_root, "sft_data_root": sft_data_root,
+            "apa": apa, "view": view,
+            "batch_size": batch_size, "num_workers": num_workers,
+            "ssl_subset_frac": ssl_subset_frac, "sft_subset_frac": sft_subset_frac,
+            "val_frac": val_frac, "epochs": epochs, "lr": lr,
+            "scheduler_step": scheduler_step, "gamma": gamma,
+            "n_sft_epochs_per_ssl_epoch": n_sft_epochs_per_ssl_epoch,
+            "save_every": save_every, "resume": resume or "",
+            "true_mae": true_mae, "masking_frac": masking_frac,
+            "win_ch": win_ch, "win_tick": win_tick,
+            "use_patch_mae": use_patch_mae, "patch_ch": patch_ch,
+            "patch_tick": patch_tick, "patch_mask_frac": patch_mask_frac,
+            "lambda_coord": lambda_coord, "lambda_charge": lambda_charge,
+            "n_classes": n_classes, "focal_gamma": focal_gamma,
+            "vicreg_lambda_v": vicreg_lambda_v, "vicreg_lambda_c": vicreg_lambda_c,
+            "checkpoints_dir": checkpoints_dir, "debug_dir": debug_dir,
+            "debug_every": debug_every, "viz_dir": viz_dir, "viz_batch": viz_batch,
+            "cache_dir": cache_dir,
+        }.items()
+    })
+    with open(Path(debug_dir) / "run_config.json", "w") as f:
+        json.dump(asdict(cfg), f, indent=2)
+
     # Resolve device BEFORE wp.init() so Warp/CuPy establish their CUDA context
     # on the correct GPU.  torch.cuda.set_device() must be called first so that
     # CuPy's raw-kernel compiler targets the same device as our tensors.
@@ -576,11 +626,18 @@ def main(
     print(f"Device: {device}")
 
     # ── Datasets & DataLoaders ────────────────────────────────────────────
+    sft_root = sft_data_root or data_root
+    print(f"SSL data_root: {data_root}")
+    print(f"SFT data_root: {sft_root}")
     ssl_dataset_full = APASparseDataset(
         data_root, apa=apa, view=view, frame_name="frame_rebinned_reco",
+        cache_dir=cache_dir,
     )
     sft_dataset = APASparseMetaDataset(
-        data_root, apa=apa, view=view, frame_name="frame_rebinned_reco",
+        sft_root, apa=apa, view=view, frame_name="frame_rebinned_reco",
+        cache_dir=cache_dir,
+        return_full_metadata=True,
+        return_pixel_truth=True,
     )
 
     # Optional SSL subset before train/val split
@@ -603,6 +660,11 @@ def main(
         sft_dataset = Subset(sft_dataset, torch.randperm(len(sft_dataset))[:n_sft_use].tolist())
         print(f"sft_subset_frac={sft_subset_frac}: using {n_sft_use} SFT samples")
 
+    # Wrap the SFT dataset so it returns pixel-level PID class labels per voxel
+    # (computed from frame_pid_1st with on-the-fly blip detection; cached
+    # per-index so repeat epochs are fast).
+    sft_dataset = SFTPixelPIDDataset(sft_dataset)
+
     ssl_train_loader = DataLoader(
         ssl_train_dataset, batch_size=batch_size, shuffle=True,
         collate_fn=voxels_collate_fn, num_workers=num_workers,
@@ -613,7 +675,7 @@ def main(
     )
     sft_loader = DataLoader(
         sft_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=voxels_label_collate_fn, num_workers=num_workers,
+        collate_fn=voxels_pixel_label_collate_fn, num_workers=num_workers,
     )
 
     print(f"SFT dataset: {len(sft_dataset)} samples")
@@ -692,8 +754,8 @@ def main(
 
         # ── SFT epochs ────────────────────────────────────────────────────
         model.reset_sft_head()
-        opt_sft = optim.AdamW(model.nu_flavor_head.parameters(),     lr=lr)
-        opt_ref = optim.AdamW(model.ref_nu_flavor_head.parameters(), lr=lr)
+        opt_sft = optim.AdamW(model.pixel_pid_head.parameters(),     lr=lr)
+        opt_ref = optim.AdamW(model.ref_pixel_pid_head.parameters(), lr=lr)
 
         all_sft_losses, all_ref_losses = [], []
         confusion_sft = torch.zeros(n_classes, n_classes, dtype=torch.long)
@@ -734,11 +796,11 @@ def main(
         print(f"  SSL features  :  CE={sft_mean:.4f}  acc={sft_acc:.1f}%")
         print(f"  Raw charge ref:  CE={ref_mean:.4f}  acc={ref_acc:.1f}%")
         print(f"\n  [SSL features]")
-        _print_confusion(confusion_sft, CLASS_NAMES)
-        _print_class_metrics(confusion_sft, CLASS_NAMES)
+        _print_confusion(confusion_sft, PIXEL_PID_CLASS_NAMES)
+        _print_class_metrics(confusion_sft, PIXEL_PID_CLASS_NAMES)
         print(f"\n  [Raw charge reference]")
-        _print_confusion(confusion_ref, CLASS_NAMES)
-        _print_class_metrics(confusion_ref, CLASS_NAMES)
+        _print_confusion(confusion_ref, PIXEL_PID_CLASS_NAMES)
+        _print_class_metrics(confusion_ref, PIXEL_PID_CLASS_NAMES)
         print(f"{'='*60}\n")
 
         if epoch % save_every == 0 or epoch == epochs:
@@ -752,5 +814,51 @@ def main(
             print(f"Checkpoint saved: {ckpt_path}")
 
 
+def from_config(
+    config_path: str,
+    run_name: str = "",
+    device: str = "cuda",
+    **overrides,
+):
+    """
+    Start MAE training from a saved run_config.json file.
+
+    Loads training parameters from a previously saved run_config.json (e.g. from
+    ./debug/<run_name>/run_config.json).  Any JSON field that does not match a
+    parameter of main() is silently ignored, so old configs with stale or
+    missing keys still work — missing fields fall back to main()'s defaults.
+
+    The `run_name`, `device`, and any **overrides** override the corresponding
+    values from the config file.
+    """
+    with open(config_path) as f:
+        raw = json.load(f)
+
+    sig = inspect.signature(main)
+    valid_params = set(sig.parameters)
+    kwargs = {k: v for k, v in raw.items() if k in valid_params}
+
+    # JSON stores nested paths (base/run_name).  main() will re-nest, so strip
+    # the trailing /<run_name> to avoid double-nesting.
+    orig_run_name = kwargs.get("run_name", "")
+    for key in ("checkpoints_dir", "debug_dir", "viz_dir"):
+        stored = kwargs.get(key, "")
+        if orig_run_name and isinstance(stored, str) and stored.endswith("/" + orig_run_name):
+            kwargs[key] = stored[: -len("/" + orig_run_name)]
+
+    if run_name:
+        kwargs["run_name"] = run_name
+    kwargs["device"] = device
+    for k, v in overrides.items():
+        if k in valid_params:
+            kwargs[k] = v
+
+    main(**kwargs)
+
+
 if __name__ == "__main__":
-    fire.Fire(main)
+    if len(sys.argv) > 1 and sys.argv[1] == "from_config":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        fire.Fire(from_config)
+    else:
+        fire.Fire(main)

@@ -1,5 +1,6 @@
 # loader/collate.py
 
+import numpy as np
 import torch
 from warpconvnet.geometry.types.voxels import Voxels
 from warpconvnet.geometry.coords.integer import IntCoords
@@ -45,6 +46,25 @@ def voxels_label_collate_fn(batch):
     """
     voxels_list, labels = zip(*batch)
     return voxels_collate_fn(list(voxels_list)), torch.tensor(labels, dtype=torch.long)
+
+
+def voxels_pixel_label_collate_fn(batch):
+    """
+    Collate (Voxels, pixel_class_array) tuples for pixel-level supervised
+    fine-tuning.
+
+    Each sample's pixel_class_array is int64[N_i] with per-voxel class indices
+    (or -1 for "ignore"), aligned to the sample's Voxels row order.  We
+    concatenate the pixel_class arrays in the same order that voxels_collate_fn
+    concatenates the voxels, so the returned LongTensor[N_total] aligns with
+    the batched Voxels' feature/coordinate tensors row-for-row.
+    """
+    voxels_list, pix_arrays = zip(*batch)
+    batched_voxels = voxels_collate_fn(list(voxels_list))
+    pix_cat = torch.from_numpy(
+        np.concatenate(list(pix_arrays), axis=0).astype(np.int64)
+    )
+    return batched_voxels, pix_cat
 
 
 def voxels_meta_collate_fn(batch):
