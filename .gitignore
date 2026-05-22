@@ -9,7 +9,7 @@ run_*
 *.out
 *.swp
 *.sub
-*.sh
+# *.sh
 *.json
 .claude
 debug
