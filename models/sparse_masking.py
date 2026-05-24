@@ -94,6 +94,96 @@ def sparse_block_mask(
 _COORD_KEY_STRIDE = 65536
 
 
+def sparse_grid_patch_mask_visible(
+    voxels: Voxels,
+    masking_frac: float,
+    patch_ch: int,
+    patch_tick: int,
+) -> tuple[Voxels, torch.Tensor]:
+    """
+    True MAE patch masking on a regular non-overlapping grid (rec #3).
+
+    Each batch item independently:
+      1. Bucket every active voxel into a (patch_ch × patch_tick) grid cell.
+      2. Identify the set of OCCUPIED patches (cells containing ≥1 voxel).
+      3. Randomly pick `ceil(masking_frac × n_occupied)` patches to mask.
+      4. Every voxel falling in a masked patch goes into `mask_bool`.
+
+    Matches polarmae's group-level random masking (with grid groups instead of
+    FPS+ball-query groups).
+
+    Parameters
+    ----------
+    voxels      : batched Voxels (C_union)
+    masking_frac: fraction of occupied patches to drop, in [0, 1]
+    patch_ch    : patch height in channels (full extent, not half-radius)
+    patch_tick  : patch width  in ticks    (full extent, not half-radius)
+
+    Returns
+    -------
+    vox_visible : Voxels with only C_visible voxels (C_masked removed)
+    mask_bool   : BoolTensor [N_union]  True at C_masked positions
+                  Indexes into the *original* voxels.feature_tensor.
+    """
+    coords  = voxels.coordinate_tensor   # [N_union, 2]
+    feats   = voxels.feature_tensor      # [N_union, C]
+    offsets = voxels.offsets             # [B+1], CPU
+
+    device    = feats.device
+    N_total   = feats.shape[0]
+    mask_bool = torch.zeros(N_total, dtype=torch.bool, device=device)
+
+    B = len(offsets) - 1
+    for i in range(B):
+        start = int(offsets[i].item())
+        end   = int(offsets[i + 1].item())
+        if end <= start:
+            continue
+        coords_i = coords[start:end]
+        # Patch key per voxel: (ch_bucket, tick_bucket), combined into a flat int.
+        ch_bkt   = (coords_i[:, 0] // patch_ch)
+        tick_bkt = (coords_i[:, 1] // patch_tick)
+        flat_key = ch_bkt * _COORD_KEY_STRIDE + tick_bkt    # int tensor [N_i]
+
+        uniq_patches = torch.unique(flat_key)
+        n_occupied   = uniq_patches.shape[0]
+        if n_occupied == 0:
+            continue
+        n_drop = math.ceil(masking_frac * n_occupied)
+        if n_drop == 0:
+            continue
+        # Random subset of patch keys to drop
+        perm = torch.randperm(n_occupied, device=device)
+        drop_keys = uniq_patches[perm[:n_drop]]
+        # Mark voxels whose patch key matches any dropped one
+        mask_i = torch.isin(flat_key, drop_keys)
+        mask_bool[start:end] = mask_i
+
+    # Same "guarantee ≥1 visible voxel per item" trick as sparse_block_mask_visible
+    vis = ~mask_bool
+    for i in range(B):
+        start = int(offsets[i].item())
+        end   = int(offsets[i + 1].item())
+        if end > start and not vis[start:end].any():
+            vis[start] = True
+
+    new_coords = coords[vis]
+    new_feats  = feats[vis]
+    new_off = [0]
+    for i in range(B):
+        start = int(offsets[i].item())
+        end   = int(offsets[i + 1].item())
+        new_off.append(new_off[-1] + int(vis[start:end].sum().item()))
+    new_offsets = torch.tensor(new_off, dtype=offsets.dtype)
+
+    vox_visible = Voxels(
+        batched_coordinates=IntCoords(new_coords, offsets=new_offsets),
+        batched_features=CatFeatures(new_feats, offsets=new_offsets),
+        offsets=new_offsets,
+    )
+    return vox_visible, mask_bool
+
+
 def sparse_block_mask_visible(
     voxels: Voxels,
     masking_frac: float,

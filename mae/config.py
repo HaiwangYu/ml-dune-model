@@ -20,6 +20,7 @@ class MAEConfig:
     ssl_subset_frac: float = 1.0          # fraction of SSL dataset to use
     sft_subset_frac: float = 1.0          # fraction of SFT dataset to use
     val_frac: float = 0.2                 # fraction of SSL dataset held out for validation
+    sft_val_frac: float = 0.2             # fraction of SFT dataset held out for probe-eval (rec #6)
     cache_dir: str = "./data"             # directory for cached dataset index .pt files
 
     # ============ Training ============
@@ -36,6 +37,8 @@ class MAEConfig:
     masking_frac: float = 0.5
     win_ch: int = 30
     win_tick: int = 50
+    mask_mode: str = "block"              # "block" (legacy seed+window) or "grid_patch" (rec #3,
+                                          # non-overlapping grid cells of size win_ch × win_tick)
 
     # ============ Patch-MAE (optional) ============
     use_patch_mae: bool = False

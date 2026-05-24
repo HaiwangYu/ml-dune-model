@@ -61,7 +61,7 @@ scratch_viz=${_CONDOR_SCRATCH_DIR}/viz
 mkdir -p "$scratch_ckpt" "$scratch_dbg" "$scratch_viz"
 
 sync_back() {
-  echo "Syncing ${_CONDOR_SCRATCH_DIR} -> ${outdir}"
+  echo "Syncing ${_CONDOR_SCRATCH_DIR} -> ${outdir} at $(date -Iseconds)"
   mkdir -p "${outdir}/checkpoints" "${outdir}/debug" "${outdir}/viz"
   # Trailing slash on source flattens the inner /${run_name} dir, so the GPFS
   # layout is ${outdir}/{checkpoints,debug,viz}/... without a redundant nest.
@@ -73,10 +73,25 @@ cleanup() {
   if [[ -n "${nvsmi_pid:-}" ]]; then
     kill "${nvsmi_pid}" 2>/dev/null || true
   fi
+  if [[ -n "${rsync_pid:-}" ]]; then
+    kill "${rsync_pid}" 2>/dev/null || true
+  fi
   sync_back
 }
 trap cleanup EXIT
 trap 'cleanup; exit 143' SIGTERM
+
+# ── Periodic rsync (every 5 min) ────────────────────────────────────────────
+# Long runs (20+ epochs) can get evicted by condor_rm; rsync's idempotent so
+# running it concurrently with training is safe.  torch.save writes are
+# atomic (tempfile + os.replace), so rsync won't pick up half-written .pt.
+(
+  while true; do
+    sleep 300
+    sync_back >/dev/null 2>&1 || true
+  done
+) &
+rsync_pid=$!
 
 # ── Background GPU usage logger ─────────────────────────────────────────────
 # Writes a CSV line every 10 s to ${outdir}/gpu.log on GPFS so you can
