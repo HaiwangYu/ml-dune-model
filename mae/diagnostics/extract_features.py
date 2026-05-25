@@ -73,11 +73,13 @@ def _run_loader(model: SparseMAEModel, loader: DataLoader, device: torch.device,
             vox_cpu, batch_labels = batch
             batch_pid_labels = None
 
-        # Snapshot raw input voxel charges before log1p, for downstream
-        # vertex-finding diagnostics (aligned to input voxel order).
-        raw_charges = vox_cpu.feature_tensor.float().cpu().numpy()
+        # Snapshot raw input voxel charges for downstream vertex-finding
+        # diagnostics.  Dataset now applies log1p in __getitem__, so undo it
+        # here to keep the .npz "charges" field in raw-ADC units (existing
+        # plot_knn_vertex expects raw values for its --charge_threshold).
+        raw_charges = torch.expm1(vox_cpu.feature_tensor.float()).cpu().numpy()
 
-        vox = log1p_voxels(voxels_to_device(vox_cpu, device))
+        vox = voxels_to_device(vox_cpu, device)
 
         if vox.feature_tensor.shape[0] == 0:
             # Empty batch: record zero-size entries for each image

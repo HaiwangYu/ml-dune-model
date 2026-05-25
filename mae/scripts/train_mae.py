@@ -44,6 +44,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import fire
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -85,6 +86,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))          # mae/
 from models.mae_model import (
     SparseMAEModel, SparseTrueMAEModel,
     voxels_to_device, log1p_voxels, expm1_voxels,
+    DensePixelHead,
     PIXEL_PID_CLASS_NAMES, PIXEL_PID_N_CLASSES,
 )
 from models.sparse_masking import sparse_block_mask, sparse_block_mask_visible, sparse_patch_mask_visible, sparse_grid_patch_mask_visible
@@ -328,7 +330,7 @@ def _train_ssl_epoch(
         if batch_idx == viz_batch and vox_cpu is not None:
             viz_vox_target = vox_cpu
 
-        vox = log1p_voxels(voxels_to_device(vox_cpu, device))
+        vox = voxels_to_device(vox_cpu, device)
 
         if vox.feature_tensor.shape[0] == 0:
             continue
@@ -409,9 +411,11 @@ def _train_ssl_epoch(
     if viz_vox_cpu is not None:
         model.eval()
         with torch.no_grad():
-            vox_viz_raw = voxels_to_device(viz_vox_cpu, device)
-            if vox_viz_raw.feature_tensor.shape[0] > 0:
-                vox_viz_log = log1p_voxels(vox_viz_raw)
+            # Dataset now applies log1p in __getitem__, so what arrives is
+            # already log-space.  Reconstruct raw-charge views via expm1 for
+            # the saved PNG only.
+            vox_viz_log = voxels_to_device(viz_vox_cpu, device)
+            if vox_viz_log.feature_tensor.shape[0] > 0:
                 if true_mae:
                     viz_in, _ = sparse_block_mask_visible(vox_viz_log, masking_frac, win_ch, win_tick)
                     pred_viz_log = model.charge_head(model.backbone(viz_in, vox_viz_log))
@@ -420,6 +424,7 @@ def _train_ssl_epoch(
                 else:
                     masked_viz_log, _ = sparse_block_mask(vox_viz_log, masking_frac, win_ch, win_tick)
                     pred_viz_log = model.charge_head(model.backbone(masked_viz_log))
+                vox_viz_raw    = expm1_voxels(vox_viz_log)
                 masked_viz_raw = expm1_voxels(masked_viz_log)
                 pred_viz_raw   = expm1_voxels(pred_viz_log)
                 _visualize_ssl(vox_viz_raw, masked_viz_raw, pred_viz_raw, epoch, viz_dir)
@@ -441,7 +446,7 @@ def _val_ssl_epoch(
     val_losses = []
     with torch.no_grad():
         for vox_cpu in ssl_val_loader:
-            vox = log1p_voxels(voxels_to_device(vox_cpu, device))
+            vox = voxels_to_device(vox_cpu, device)
             if vox.feature_tensor.shape[0] == 0:
                 continue
             if true_mae:
@@ -482,7 +487,7 @@ def _train_sft_epoch(
     confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
 
     for step, (vox_sft_cpu, pix_labels) in enumerate(sft_loader):
-        vox_sft   = log1p_voxels(voxels_to_device(vox_sft_cpu, device))
+        vox_sft   = voxels_to_device(vox_sft_cpu, device)
         pix_labels = pix_labels.to(device)
 
         if vox_sft.feature_tensor.shape[0] == 0:
@@ -555,7 +560,7 @@ def _val_sft_epoch(
     confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
 
     for vox_sft_cpu, pix_labels in sft_val_loader:
-        vox_sft    = log1p_voxels(voxels_to_device(vox_sft_cpu, device))
+        vox_sft    = voxels_to_device(vox_sft_cpu, device)
         pix_labels = pix_labels.to(device)
         if vox_sft.feature_tensor.shape[0] == 0:
             continue
@@ -588,6 +593,249 @@ def _val_sft_epoch(
 
 
 # ---------------------------------------------------------------------------
+# Offline-pool SFT (rec #B from polarmae_vs_mae comparison)
+# ---------------------------------------------------------------------------
+#
+# Mirrors polarmae's APA2DProbeCallback._collect_pool + _train_head pattern:
+#   1. Extract backbone features ONCE over the SFT train+val splits (frozen).
+#   2. Cap per-class to keep the pool balanced.
+#   3. Train a tiny DensePixelHead on the in-memory pool for N epochs.
+#   4. Evaluate on the val pool.
+# Backbone is run num_sft_batches times per SSL epoch instead of num_sft_batches
+# × n_sft_epochs × 2 heads in the legacy online path → ~10× less compute.
+
+@torch.no_grad()
+def _collect_sft_pool(
+    model, sft_loader, device, n_classes,
+    max_pixels_per_class: int = 5000,
+    seed: int = 0,
+):
+    """Drain `sft_loader` once with the backbone frozen; pool per-voxel backbone
+    features + raw charges + per-voxel pixel-PID class.  Stratified per-class
+    sampling so the pool stays balanced even when one class dominates the data.
+
+    Returns
+    -------
+    feats : np.float32 [M, D]   backbone features at pooled voxels
+    raws  : np.float32 [M, 3]   raw (channel, tick, log_charge) at same voxels
+    cls   : np.int64   [M]      pixel-PID class index 0..n_classes-1 (ignore -1 dropped)
+    counts: np.int64   [n_classes]  total seen per class (before subsample cap)
+    """
+    rng = np.random.default_rng(seed)
+    pool_feats = [[] for _ in range(n_classes)]
+    pool_raws  = [[] for _ in range(n_classes)]
+    pool_counts = np.zeros(n_classes, dtype=np.int64)
+    cap = int(max_pixels_per_class)
+
+    model.eval()
+    for vox_cpu, pix_labels in sft_loader:
+        if int(pool_counts.min()) >= cap:
+            break
+        vox = voxels_to_device(vox_cpu, device)
+        if vox.feature_tensor.shape[0] == 0:
+            continue
+        # Use the same forward_sft path the online SFT uses — it handles both
+        # SparseMAEModel and SparseTrueMAEModel signatures internally.  But
+        # we want raw backbone features (before the head), so call backbone
+        # directly (forward_sft would route through pixel_pid_head).
+        if hasattr(model.backbone, "forward") and "vox_union" in model.backbone.forward.__code__.co_varnames:
+            backbone_out = model.backbone(vox, vox)
+        else:
+            backbone_out = model.backbone(vox)
+        feats = backbone_out.feature_tensor.detach().float().cpu().numpy()       # [N_total, D]
+        coords = backbone_out.coordinate_tensor.detach().cpu().numpy()           # [N_total, 2]
+        # Raw charge per voxel (vox_cpu carries log1p'd, undo it).
+        raw_chg = torch.expm1(vox_cpu.feature_tensor.float()).cpu().numpy()       # [N_total, 1]
+        raw = np.concatenate([coords.astype(np.float32),
+                              np.log1p(raw_chg.astype(np.float32))], axis=1)     # [N_total, 3]
+
+        labels = pix_labels.cpu().numpy() if hasattr(pix_labels, "cpu") else np.asarray(pix_labels)
+        if labels.shape[0] != feats.shape[0]:
+            continue
+        for c in range(n_classes):
+            need = cap - int(pool_counts[c])
+            if need <= 0:
+                continue
+            mask = labels == c
+            n_avail = int(mask.sum())
+            if n_avail == 0:
+                continue
+            if n_avail <= need:
+                pool_feats[c].append(feats[mask])
+                pool_raws[c].append(raw[mask])
+                pool_counts[c] += n_avail
+            else:
+                idx = rng.choice(np.where(mask)[0], size=need, replace=False)
+                pool_feats[c].append(feats[idx])
+                pool_raws[c].append(raw[idx])
+                pool_counts[c] += need
+
+    F_parts, R_parts, L_parts = [], [], []
+    for c in range(n_classes):
+        if pool_feats[c]:
+            f_c = np.concatenate(pool_feats[c])
+            r_c = np.concatenate(pool_raws[c])
+            F_parts.append(f_c)
+            R_parts.append(r_c)
+            L_parts.append(np.full(len(f_c), c, dtype=np.int64))
+    if not F_parts:
+        return (np.zeros((0, 64), dtype=np.float32),
+                np.zeros((0, 3),  dtype=np.float32),
+                np.zeros((0,),    dtype=np.int64),
+                pool_counts)
+    return (np.concatenate(F_parts).astype(np.float32),
+            np.concatenate(R_parts).astype(np.float32),
+            np.concatenate(L_parts).astype(np.int64),
+            pool_counts)
+
+
+def _fit_dense_head(
+    X: np.ndarray, y: np.ndarray, n_classes: int, device,
+    *, epochs: int = 30, batch_size: int = 256, lr: float = 5e-3, seed: int = 0,
+):
+    """Train a fresh DensePixelHead on (X, y) for `epochs` epochs.  Returns
+    the trained head + per-epoch train accuracy."""
+    torch.manual_seed(seed)
+    head = DensePixelHead(in_ch=X.shape[1], n_classes=n_classes).to(device)
+    opt  = optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
+    X_t = torch.from_numpy(X).to(device)
+    y_t = torch.from_numpy(y).to(device)
+    N = X_t.shape[0]
+    perm_rng = np.random.default_rng(seed)
+    accs = []
+    for ep in range(epochs):
+        head.train()
+        order = torch.from_numpy(perm_rng.permutation(N)).to(device)
+        correct = 0
+        for s in range(0, N, batch_size):
+            idx = order[s:s + batch_size]
+            xb, yb = X_t[idx], y_t[idx]
+            logits = head(xb)
+            loss = F.cross_entropy(logits, yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+            with torch.no_grad():
+                correct += int((logits.argmax(dim=1) == yb).sum())
+        accs.append(correct / max(N, 1))
+    return head, accs
+
+
+@torch.no_grad()
+def _predict_dense_head(head, X: np.ndarray, device, batch_size: int = 2048) -> np.ndarray:
+    """Run a trained DensePixelHead on X (chunked) and return argmax preds."""
+    head.eval()
+    X_t = torch.from_numpy(X).to(device)
+    out = torch.empty(X_t.shape[0], dtype=torch.long, device=device)
+    for s in range(0, X_t.shape[0], batch_size):
+        out[s:s + batch_size] = head(X_t[s:s + batch_size]).argmax(dim=1)
+    return out.cpu().numpy()
+
+
+def _confusion_and_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int):
+    """Return (confusion[n_classes, n_classes], per_class_eff, per_class_pur,
+    overall_acc, macro_f1).  All ignore -1 labels."""
+    valid = y_true >= 0
+    yt = y_true[valid]; yp = y_pred[valid]
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    np.add.at(cm, (yt, yp), 1)
+    diag = cm.diagonal().astype(np.float64)
+    row  = cm.sum(axis=1).astype(np.float64)
+    col  = cm.sum(axis=0).astype(np.float64)
+    eff = np.where(row > 0, diag / np.maximum(row, 1), np.nan)
+    pur = np.where(col > 0, diag / np.maximum(col, 1), np.nan)
+    f1  = np.where((eff + pur) > 0, 2 * eff * pur / (eff + pur + 1e-12), np.nan)
+    macro_f1 = float(np.nanmean(f1))
+    acc = float(diag.sum() / max(cm.sum(), 1))
+    return cm.tolist(), eff.tolist(), pur.tolist(), acc, macro_f1
+
+
+def _fit_svm_on_pool(X_tr, y_tr, X_va, y_va, n_classes, *, C: float = 1.0, seed: int = 0):
+    """sklearn LinearSVC fit + score on a feature pool.  Returns the same
+    metric dict structure as the dense-head probes."""
+    from sklearn.svm import LinearSVC
+    svm = LinearSVC(C=C, class_weight="balanced", random_state=seed)
+    svm.fit(X_tr, y_tr)
+    pred_tr = svm.predict(X_tr)
+    pred_va = svm.predict(X_va)
+    cm_tr, eff_tr, pur_tr, acc_tr, f1_tr = _confusion_and_metrics(y_tr, pred_tr, n_classes)
+    cm_va, eff_va, pur_va, acc_va, f1_va = _confusion_and_metrics(y_va, pred_va, n_classes)
+    return {
+        "train_acc": acc_tr, "val_acc": acc_va,
+        "train_macro_f1": f1_tr, "val_macro_f1": f1_va,
+        "train_cm": cm_tr, "val_cm": cm_va,
+        "train_eff": eff_tr, "val_eff": eff_va,
+        "train_pur": pur_tr, "val_pur": pur_va,
+    }
+
+
+def _run_offline_sft(
+    model, sft_train_loader, sft_val_loader, device, class_names,
+    *, epochs: int = 30, batch_size: int = 256, lr: float = 5e-3,
+    max_pixels_per_class: int = 5000, seed: int = 0,
+    svm_C: float = 1.0,
+):
+    """End-to-end offline SFT + SVM for one SSL epoch.  Pools features once
+    on train+val, runs **four** probes from the same pool:
+        sft_feat, sft_raw, voxel_svm_feat, voxel_svm_raw
+    matching polarmae's APA2DProbeCallback.  Returns a dict ready to drop
+    into sft_history.json under the 'offline_sft' key.
+    """
+    n_classes = len(class_names)
+    print(f"  [SFT offline] collecting train pool (cap {max_pixels_per_class}/class) ...")
+    X_tr, R_tr, y_tr, cnt_tr = _collect_sft_pool(
+        model, sft_train_loader, device, n_classes,
+        max_pixels_per_class=max_pixels_per_class, seed=seed,
+    )
+    print(f"  [SFT offline] collecting val pool ...")
+    X_va, R_va, y_va, cnt_va = _collect_sft_pool(
+        model, sft_val_loader, device, n_classes,
+        max_pixels_per_class=max_pixels_per_class, seed=seed + 1,
+    )
+
+    out = {"n_train": int(len(y_tr)), "n_val": int(len(y_va))}
+
+    # --- SFT (dense MLP) on backbone features
+    head_feat, _ = _fit_dense_head(X_tr, y_tr, n_classes, device,
+                                   epochs=epochs, batch_size=batch_size, lr=lr, seed=seed)
+    pred_tr = _predict_dense_head(head_feat, X_tr, device)
+    pred_va = _predict_dense_head(head_feat, X_va, device)
+    cm_tr, eff_tr, pur_tr, acc_tr, f1_tr = _confusion_and_metrics(y_tr, pred_tr, n_classes)
+    cm_va, eff_va, pur_va, acc_va, f1_va = _confusion_and_metrics(y_va, pred_va, n_classes)
+    out["sft_feat"] = {
+        "train_acc": acc_tr, "val_acc": acc_va,
+        "train_macro_f1": f1_tr, "val_macro_f1": f1_va,
+        "train_cm": cm_tr, "val_cm": cm_va,
+        "train_eff": eff_tr, "val_eff": eff_va,
+        "train_pur": pur_tr, "val_pur": pur_va,
+    }
+
+    # --- SFT (dense MLP) on raw (channel, tick, log_charge)
+    head_raw, _ = _fit_dense_head(R_tr, y_tr, n_classes, device,
+                                  epochs=epochs, batch_size=batch_size, lr=lr, seed=seed)
+    rpred_tr = _predict_dense_head(head_raw, R_tr, device)
+    rpred_va = _predict_dense_head(head_raw, R_va, device)
+    rcm_tr, reff_tr, rpur_tr, racc_tr, rf1_tr = _confusion_and_metrics(y_tr, rpred_tr, n_classes)
+    rcm_va, reff_va, rpur_va, racc_va, rf1_va = _confusion_and_metrics(y_va, rpred_va, n_classes)
+    out["sft_raw"] = {
+        "train_acc": racc_tr, "val_acc": racc_va,
+        "train_macro_f1": rf1_tr, "val_macro_f1": rf1_va,
+        "train_cm": rcm_tr, "val_cm": rcm_va,
+        "train_eff": reff_tr, "val_eff": reff_va,
+        "train_pur": rpur_tr, "val_pur": rpur_va,
+    }
+
+    # --- SVM on backbone features  (rec #C)
+    out["voxel_svm_feat"] = _fit_svm_on_pool(X_tr, y_tr, X_va, y_va, n_classes, C=svm_C, seed=seed)
+    # --- SVM on raw (channel, tick, log_charge)  (rec #C)
+    out["voxel_svm_raw"]  = _fit_svm_on_pool(R_tr, y_tr, R_va, y_va, n_classes, C=svm_C, seed=seed)
+
+    print(f"  [SFT offline]  sft_feat:       train_acc={acc_tr:.3f}  val_acc={acc_va:.3f}  val_macro_f1={f1_va:.3f}")
+    print(f"  [SFT offline]  sft_raw:        train_acc={racc_tr:.3f}  val_acc={racc_va:.3f}  val_macro_f1={rf1_va:.3f}")
+    print(f"  [SFT offline]  voxel_svm_feat: val_acc={out['voxel_svm_feat']['val_acc']:.3f}  val_macro_f1={out['voxel_svm_feat']['val_macro_f1']:.3f}")
+    print(f"  [SFT offline]  voxel_svm_raw:  val_acc={out['voxel_svm_raw']['val_acc']:.3f}  val_macro_f1={out['voxel_svm_raw']['val_macro_f1']:.3f}")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -611,6 +859,11 @@ def main(
     sft_subset_frac            = 1.0,  # fraction of SFT dataset to use
     val_frac                   = 0.2,  # fraction of SSL dataset held out for validation
     sft_val_frac               = 0.2,  # fraction of SFT dataset held out for probe-eval (rec #6)
+    sft_mode                   = "offline_pool",  # "offline_pool" (rec #B) or "online" (legacy)
+    sft_pool_max_pixels        = 5000, # per-class cap when sft_mode=offline_pool
+    sft_pool_epochs            = 30,
+    sft_pool_batch             = 256,
+    sft_pool_lr                = 5e-3,
     num_workers                = 0,    # set >0 only if warp is initialised in workers
     device                     = "cuda",
     checkpoints_dir            = "./checkpoints",
@@ -649,6 +902,11 @@ def main(
             "batch_size": batch_size, "num_workers": num_workers,
             "ssl_subset_frac": ssl_subset_frac, "sft_subset_frac": sft_subset_frac,
             "val_frac": val_frac, "sft_val_frac": sft_val_frac,
+            "sft_mode": sft_mode,
+            "sft_pool_max_pixels": sft_pool_max_pixels,
+            "sft_pool_epochs": sft_pool_epochs,
+            "sft_pool_batch": sft_pool_batch,
+            "sft_pool_lr": sft_pool_lr,
             "epochs": epochs, "lr": lr,
             "scheduler_step": scheduler_step, "gamma": gamma,
             "n_sft_epochs_per_ssl_epoch": n_sft_epochs_per_ssl_epoch,
@@ -730,21 +988,29 @@ def main(
     sft_train_dataset = Subset(sft_dataset, sft_idx[:n_sft_train])
     sft_val_dataset   = Subset(sft_dataset, sft_idx[n_sft_train:])
 
+    # rec #A.1: persistent workers + pin_memory to keep the GPU fed.  Only
+    # turn on persistent_workers when num_workers > 0 (avoids harmless
+    # PyTorch warning).
+    _dl_kwargs = dict(
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
+        pin_memory=True,
+    )
     ssl_train_loader = DataLoader(
         ssl_train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=voxels_collate_fn, num_workers=num_workers,
+        collate_fn=voxels_collate_fn, **_dl_kwargs,
     )
     ssl_val_loader = DataLoader(
         ssl_val_dataset, batch_size=batch_size, shuffle=False,
-        collate_fn=voxels_collate_fn, num_workers=num_workers,
+        collate_fn=voxels_collate_fn, **_dl_kwargs,
     )
     sft_loader = DataLoader(
         sft_train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=voxels_pixel_label_collate_fn, num_workers=num_workers,
+        collate_fn=voxels_pixel_label_collate_fn, **_dl_kwargs,
     )
     sft_val_loader = DataLoader(
         sft_val_dataset, batch_size=batch_size, shuffle=False,
-        collate_fn=voxels_pixel_label_collate_fn, num_workers=num_workers,
+        collate_fn=voxels_pixel_label_collate_fn, **_dl_kwargs,
     )
 
     print(f"SFT dataset: total={n_sft_total}  train={n_sft_train}  val={n_sft_val}")
@@ -823,115 +1089,135 @@ def main(
         debugger.log_ssl_epoch_summary(epoch, ssl_mean, val_mean)
         debugger.save_histories()
 
-        # ── SFT epochs ────────────────────────────────────────────────────
-        model.reset_sft_head()
-        opt_sft = optim.AdamW(model.pixel_pid_head.parameters(),     lr=lr)
-        opt_ref = optim.AdamW(model.ref_pixel_pid_head.parameters(), lr=lr)
-
-        all_sft_losses, all_ref_losses = [], []
-        confusion_sft = torch.zeros(n_classes, n_classes, dtype=torch.long)
-        confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
-
-        for sft_epoch in range(1, n_sft_epochs_per_ssl_epoch + 1):
-            sft_losses, conf_sft_ep, ref_losses, conf_ref_ep = _train_sft_epoch(
-                model, sft_loader, opt_sft, opt_ref,
-                device, n_classes, epoch, sft_epoch,
-                focal_gamma=focal_gamma,
+        # ── SFT (either offline-pool [rec #B] or legacy online) ───────────
+        offline_sft_result = None
+        if sft_mode == "offline_pool":
+            offline_sft_result = _run_offline_sft(
+                model, sft_loader, sft_val_loader, device, PIXEL_PID_CLASS_NAMES,
+                epochs=sft_pool_epochs, batch_size=sft_pool_batch, lr=sft_pool_lr,
+                max_pixels_per_class=sft_pool_max_pixels, seed=42 + epoch,
             )
-            all_sft_losses.extend(sft_losses)
-            all_ref_losses.extend(ref_losses)
-            confusion_sft += conf_sft_ep
-            confusion_ref += conf_ref_ep
+            # Persist directly into sft_history under the new schema; skip the
+            # online per-sub-epoch loop and the legacy log_sft_aggregate call.
+            ent = debugger._sft_epoch_entry(epoch)
+            ent["offline_sft"] = offline_sft_result
+            if not debugger.sft_history["class_names"]:
+                debugger.sft_history["class_names"] = list(PIXEL_PID_CLASS_NAMES)
 
-            sft_mean_ep = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
-            ref_mean_ep = sum(ref_losses)  / len(ref_losses)  if ref_losses  else float("nan")
-            total_s     = int(conf_sft_ep.sum())
-            acc_s       = 100.0 * int(conf_sft_ep.diagonal().sum()) / total_s if total_s > 0 else float("nan")
-            total_r     = int(conf_ref_ep.sum())
-            acc_r       = 100.0 * int(conf_ref_ep.diagonal().sum()) / total_r if total_r > 0 else float("nan")
+        # Legacy online path (kept for fallback / ablation).
+        if sft_mode == "online":
+            model.reset_sft_head()
+            opt_sft = optim.AdamW(model.pixel_pid_head.parameters(),     lr=lr)
+            opt_ref = optim.AdamW(model.ref_pixel_pid_head.parameters(), lr=lr)
 
-            # Held-out probe-eval split (rec #6) — no grad, current frozen heads.
-            val_sft_losses, val_conf_sft, val_ref_losses, val_conf_ref = _val_sft_epoch(
-                model, sft_val_loader, device, n_classes, focal_gamma=focal_gamma,
+            all_sft_losses, all_ref_losses = [], []
+            confusion_sft = torch.zeros(n_classes, n_classes, dtype=torch.long)
+            confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
+
+            for sft_epoch in range(1, n_sft_epochs_per_ssl_epoch + 1):
+                sft_losses, conf_sft_ep, ref_losses, conf_ref_ep = _train_sft_epoch(
+                    model, sft_loader, opt_sft, opt_ref,
+                    device, n_classes, epoch, sft_epoch,
+                    focal_gamma=focal_gamma,
+                )
+                all_sft_losses.extend(sft_losses)
+                all_ref_losses.extend(ref_losses)
+                confusion_sft += conf_sft_ep
+                confusion_ref += conf_ref_ep
+
+                sft_mean_ep = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
+                ref_mean_ep = sum(ref_losses)  / len(ref_losses)  if ref_losses  else float("nan")
+                total_s     = int(conf_sft_ep.sum())
+                acc_s       = 100.0 * int(conf_sft_ep.diagonal().sum()) / total_s if total_s > 0 else float("nan")
+                total_r     = int(conf_ref_ep.sum())
+                acc_r       = 100.0 * int(conf_ref_ep.diagonal().sum()) / total_r if total_r > 0 else float("nan")
+
+                # Held-out probe-eval split (rec #6) — no grad, current frozen heads.
+                val_sft_losses, val_conf_sft, val_ref_losses, val_conf_ref = _val_sft_epoch(
+                    model, sft_val_loader, device, n_classes, focal_gamma=focal_gamma,
+                )
+                val_sft_mean_ep = sum(val_sft_losses) / len(val_sft_losses) if val_sft_losses else float("nan")
+                val_ref_mean_ep = sum(val_ref_losses) / len(val_ref_losses) if val_ref_losses else float("nan")
+                v_tot_s         = int(val_conf_sft.sum())
+                v_acc_s         = 100.0 * int(val_conf_sft.diagonal().sum()) / v_tot_s if v_tot_s > 0 else float("nan")
+                v_tot_r         = int(val_conf_ref.sum())
+                v_acc_r         = 100.0 * int(val_conf_ref.diagonal().sum()) / v_tot_r if v_tot_r > 0 else float("nan")
+
+                print(
+                    f"  SFT epoch {sft_epoch}/{n_sft_epochs_per_ssl_epoch}"
+                    f"  |  SSL-feat: train CE={sft_mean_ep:.4f} acc={acc_s:.1f}%  val CE={val_sft_mean_ep:.4f} acc={v_acc_s:.1f}%"
+                    f"  |  raw-charge: train CE={ref_mean_ep:.4f} acc={acc_r:.1f}%  val CE={val_ref_mean_ep:.4f} acc={v_acc_r:.1f}%"
+                )
+                debugger.log_sft_subepoch(
+                    epoch=epoch, sft_epoch=sft_epoch,
+                    sft_ce=sft_mean_ep, sft_acc=acc_s / 100.0,
+                    ref_ce=ref_mean_ep, ref_acc=acc_r / 100.0,
+                    sft_val_ce=val_sft_mean_ep, sft_val_acc=v_acc_s / 100.0,
+                    ref_val_ce=val_ref_mean_ep, ref_val_acc=v_acc_r / 100.0,
+                )
+
+            sft_mean  = sum(all_sft_losses) / len(all_sft_losses) if all_sft_losses else float("nan")
+            ref_mean  = sum(all_ref_losses)  / len(all_ref_losses)  if all_ref_losses  else float("nan")
+            total_sft = int(confusion_sft.sum())
+            sft_acc   = 100.0 * int(confusion_sft.diagonal().sum()) / total_sft if total_sft > 0 else 0.0
+            total_ref = int(confusion_ref.sum())
+            ref_acc   = 100.0 * int(confusion_ref.diagonal().sum()) / total_ref if total_ref > 0 else 0.0
+
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch:3d}  |  SSL train L1={ssl_mean:.4f}  val L1={val_mean:.4f}")
+            print(f"  SSL features  :  CE={sft_mean:.4f}  acc={sft_acc:.1f}%")
+            print(f"  Raw charge ref:  CE={ref_mean:.4f}  acc={ref_acc:.1f}%")
+            print(f"\n  [SSL features]")
+            _print_confusion(confusion_sft, PIXEL_PID_CLASS_NAMES)
+            _print_class_metrics(confusion_sft, PIXEL_PID_CLASS_NAMES)
+            print(f"\n  [Raw charge reference]")
+            _print_confusion(confusion_ref, PIXEL_PID_CLASS_NAMES)
+            _print_class_metrics(confusion_ref, PIXEL_PID_CLASS_NAMES)
+            print(f"{'='*60}\n")
+
+            debugger.log_sft_aggregate(
+                epoch=epoch, class_names=PIXEL_PID_CLASS_NAMES,
+                sft_ce=sft_mean, sft_acc=sft_acc / 100.0,
+                ref_ce=ref_mean, ref_acc=ref_acc / 100.0,
+                confusion_sft=confusion_sft, confusion_ref=confusion_ref,
             )
-            val_sft_mean_ep = sum(val_sft_losses) / len(val_sft_losses) if val_sft_losses else float("nan")
-            val_ref_mean_ep = sum(val_ref_losses) / len(val_ref_losses) if val_ref_losses else float("nan")
-            v_tot_s         = int(val_conf_sft.sum())
-            v_acc_s         = 100.0 * int(val_conf_sft.diagonal().sum()) / v_tot_s if v_tot_s > 0 else float("nan")
-            v_tot_r         = int(val_conf_ref.sum())
-            v_acc_r         = 100.0 * int(val_conf_ref.diagonal().sum()) / v_tot_r if v_tot_r > 0 else float("nan")
-
-            print(
-                f"  SFT epoch {sft_epoch}/{n_sft_epochs_per_ssl_epoch}"
-                f"  |  SSL-feat: train CE={sft_mean_ep:.4f} acc={acc_s:.1f}%  val CE={val_sft_mean_ep:.4f} acc={v_acc_s:.1f}%"
-                f"  |  raw-charge: train CE={ref_mean_ep:.4f} acc={acc_r:.1f}%  val CE={val_ref_mean_ep:.4f} acc={v_acc_r:.1f}%"
-            )
-            debugger.log_sft_subepoch(
-                epoch=epoch, sft_epoch=sft_epoch,
-                sft_ce=sft_mean_ep, sft_acc=acc_s / 100.0,
-                ref_ce=ref_mean_ep, ref_acc=acc_r / 100.0,
-                sft_val_ce=val_sft_mean_ep, sft_val_acc=v_acc_s / 100.0,
-                ref_val_ce=val_ref_mean_ep, ref_val_acc=v_acc_r / 100.0,
-            )
-
-        sft_mean  = sum(all_sft_losses) / len(all_sft_losses) if all_sft_losses else float("nan")
-        ref_mean  = sum(all_ref_losses)  / len(all_ref_losses)  if all_ref_losses  else float("nan")
-        total_sft = int(confusion_sft.sum())
-        sft_acc   = 100.0 * int(confusion_sft.diagonal().sum()) / total_sft if total_sft > 0 else 0.0
-        total_ref = int(confusion_ref.sum())
-        ref_acc   = 100.0 * int(confusion_ref.diagonal().sum()) / total_ref if total_ref > 0 else 0.0
-
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch:3d}  |  SSL train L1={ssl_mean:.4f}  val L1={val_mean:.4f}")
-        print(f"  SSL features  :  CE={sft_mean:.4f}  acc={sft_acc:.1f}%")
-        print(f"  Raw charge ref:  CE={ref_mean:.4f}  acc={ref_acc:.1f}%")
-        print(f"\n  [SSL features]")
-        _print_confusion(confusion_sft, PIXEL_PID_CLASS_NAMES)
-        _print_class_metrics(confusion_sft, PIXEL_PID_CLASS_NAMES)
-        print(f"\n  [Raw charge reference]")
-        _print_confusion(confusion_ref, PIXEL_PID_CLASS_NAMES)
-        _print_class_metrics(confusion_ref, PIXEL_PID_CLASS_NAMES)
-        print(f"{'='*60}\n")
-
-        debugger.log_sft_aggregate(
-            epoch=epoch, class_names=PIXEL_PID_CLASS_NAMES,
-            sft_ce=sft_mean, sft_acc=sft_acc / 100.0,
-            ref_ce=ref_mean, ref_acc=ref_acc / 100.0,
-            confusion_sft=confusion_sft, confusion_ref=confusion_ref,
-        )
 
         # ── SVM linear-probe on backbone features ─────────────────────────
-        try:
-            if true_mae:
-                # MinkUNetTrueMAECore.forward(vox_visible, vox_union); for the
-                # probe we pass the same Voxels for both (no masking at eval).
-                feature_fn = lambda v: model.backbone(v, v)
-            else:
-                feature_fn = lambda v: model.backbone(v)
-            svm_res = svm_probe(
-                feature_fn=feature_fn,
-                sft_loader=sft_loader,
-                device=device,
-                class_names=PIXEL_PID_CLASS_NAMES,
-                max_pixels_per_class=5000,
-                svm_C=1.0,
-                train_frac=0.8,
-                seed=42 + epoch,
-                prepare_voxels=lambda v: log1p_voxels(voxels_to_device(v, device)),
-            )
-            tr_f1 = svm_res.get("train_class_f1", {})
-            va_f1 = svm_res.get("val_class_f1", {})
-            print(
-                f"  [SVM probe]  train_acc={svm_res.get('train_acc', float('nan')):.3f}  "
-                f"val_acc={svm_res.get('val_acc', float('nan')):.3f}  "
-                f"val macro-F1={svm_res.get('val_macro_f1', float('nan')):.3f}  "
-                f"per-class F1 (val): "
-                + " ".join(f"{n}:{va_f1.get(n, float('nan')):.2f}"
-                           for n in PIXEL_PID_CLASS_NAMES)
-            )
-            debugger.log_svm_probe(epoch, svm_res)
-        except Exception as e:
-            print(f"  [SVM probe] failed: {e}")
+        # In offline_pool mode the offline_sft block already fit voxel_svm_feat
+        # and voxel_svm_raw from the same pool, so this standalone svm_probe
+        # call is redundant.  Run it only for the legacy online mode.
+        if sft_mode == "online":
+            try:
+                if true_mae:
+                    # MinkUNetTrueMAECore.forward(vox_visible, vox_union); for the
+                    # probe we pass the same Voxels for both (no masking at eval).
+                    feature_fn = lambda v: model.backbone(v, v)
+                else:
+                    feature_fn = lambda v: model.backbone(v)
+                svm_res = svm_probe(
+                    feature_fn=feature_fn,
+                    sft_loader=sft_loader,
+                    device=device,
+                    class_names=PIXEL_PID_CLASS_NAMES,
+                    max_pixels_per_class=5000,
+                    svm_C=1.0,
+                    train_frac=0.8,
+                    seed=42 + epoch,
+                    prepare_voxels=lambda v: voxels_to_device(v, device),
+                )
+                tr_f1 = svm_res.get("train_class_f1", {})
+                va_f1 = svm_res.get("val_class_f1", {})
+                print(
+                    f"  [SVM probe]  train_acc={svm_res.get('train_acc', float('nan')):.3f}  "
+                    f"val_acc={svm_res.get('val_acc', float('nan')):.3f}  "
+                    f"val macro-F1={svm_res.get('val_macro_f1', float('nan')):.3f}  "
+                    f"per-class F1 (val): "
+                    + " ".join(f"{n}:{va_f1.get(n, float('nan')):.2f}"
+                               for n in PIXEL_PID_CLASS_NAMES)
+                )
+                debugger.log_svm_probe(epoch, svm_res)
+            except Exception as e:
+                print(f"  [SVM probe] failed: {e}")
 
         debugger.save_sft_history()
 

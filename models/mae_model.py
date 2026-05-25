@@ -194,6 +194,32 @@ def pdg_to_pixel_class(
 # Sparse heads
 # ---------------------------------------------------------------------------
 
+class DensePixelHead(nn.Module):
+    """
+    Dense MLP version of SparsePixelHead.  Used by the offline "extract once,
+    train head on pool" SFT pattern (rec #B from the v2 post-mortem): the
+    backbone produces feature tensors per batch, those features are pooled
+    into one numpy array, then this head is trained on that pool with no
+    further backbone forwards.
+
+    Operates on a plain [N, in_ch] feature tensor (no Voxels container).
+    Forward returns [N, n_classes] logits.
+    """
+
+    def __init__(self, in_ch: int = 64, n_classes: int = 3, hidden: int = 128):
+        super().__init__()
+        self.fc1 = nn.Linear(in_ch, hidden)
+        self.bn1 = nn.BatchNorm1d(hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.bn2 = nn.BatchNorm1d(hidden)
+        self.fc3 = nn.Linear(hidden, n_classes)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = F.relu(self.bn2(self.fc2(x)))
+        return self.fc3(x)
+
+
 class SparsePixelHead(nn.Module):
     """
     Pointwise sparse classification head.  No spatial mixing — three 1×1

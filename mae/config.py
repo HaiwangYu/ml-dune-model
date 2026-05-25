@@ -54,6 +54,13 @@ class MAEConfig:
     vicreg_lambda_v: float = 0.0
     vicreg_lambda_c: float = 0.0
 
+    # ============ SFT mode (rec #B from polarmae comparison) ============
+    sft_mode: str = "offline_pool"        # "offline_pool" or "online" (legacy)
+    sft_pool_max_pixels: int = 5000       # per-class cap in offline pool
+    sft_pool_epochs: int = 30
+    sft_pool_batch: int = 256
+    sft_pool_lr: float = 5e-3
+
     # ============ Output / debug ============
     checkpoints_dir: str = "./checkpoints"
     debug_dir: str = "./debug"

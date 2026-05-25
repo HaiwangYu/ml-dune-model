@@ -173,15 +173,15 @@ class APASparseMetaDataset(APASparseDataset):
             return self._unknown_metadata(event_key)
 
         try:
-            with h5py.File(metadata_path, "r") as f:
-                row = f[group]["metadata"][0]
-                nu_pdg     = int(row["nu_pdg"])
-                nu_ccnc    = int(row["nu_ccnc"])
-                nu_intType = int(row["nu_intType"])
-                nu_energy  = float(row["nu_energy"])
-                vx = float(row["nu_vertex_x"])
-                vy = float(row["nu_vertex_y"])
-                vz = float(row["nu_vertex_z"])
+            f = self._h5(metadata_path)
+            row = f[group]["metadata"][0]
+            nu_pdg     = int(row["nu_pdg"])
+            nu_ccnc    = int(row["nu_ccnc"])
+            nu_intType = int(row["nu_intType"])
+            nu_energy  = float(row["nu_energy"])
+            vx = float(row["nu_vertex_x"])
+            vy = float(row["nu_vertex_y"])
+            vz = float(row["nu_vertex_z"])
         except Exception as e:
             self._warn_once(metadata_path, f"Could not read metadata from {metadata_path}[{group}]: {e}")
             return self._unknown_metadata(event_key)
@@ -209,17 +209,17 @@ class APASparseMetaDataset(APASparseDataset):
         Pixels with no pid1 hit carry value 0.
         """
         try:
-            with h5py.File(pixeldata_path, "r") as f:
-                g = f[group]
-                reco_coords = g[self.frame_name]["coords"][()]   # (N, 2) int32
+            f = self._h5(pixeldata_path)
+            g = f[group]
+            reco_coords = g[self.frame_name]["coords"][()]   # (N, 2) int32
 
-                if "frame_pid_1st" not in g:
-                    mask = ((reco_coords[:, 0] >= self.ch_start) &
-                            (reco_coords[:, 0] < self.ch_end))
-                    return np.zeros(int(mask.sum()), dtype=np.int32)
+            if "frame_pid_1st" not in g:
+                mask = ((reco_coords[:, 0] >= self.ch_start) &
+                        (reco_coords[:, 0] < self.ch_end))
+                return np.zeros(int(mask.sum()), dtype=np.int32)
 
-                pid1_coords = g["frame_pid_1st"]["coords"][()]   # (M, 2) int32
-                pid1_feats  = g["frame_pid_1st"]["features"][()]  # (M,) float32
+            pid1_coords = g["frame_pid_1st"]["coords"][()]   # (M, 2) int32
+            pid1_feats  = g["frame_pid_1st"]["features"][()]  # (M,) float32
         except Exception as e:
             self._warn_once(
                 pixeldata_path,

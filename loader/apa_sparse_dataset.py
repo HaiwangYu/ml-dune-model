@@ -2,6 +2,7 @@
 
 import hashlib
 import h5py
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -45,6 +46,11 @@ class APASparseDataset(Dataset):
     The recursive glob handles arbitrary nesting depth automatically.
     """
 
+    # Worker-local LRU cache of open h5py file handles (set up lazily in __getitem__
+    # so each DataLoader worker has its own, post-fork — handles can't be shared
+    # across fork()).  Shape: OrderedDict[str(path) -> h5py.File].
+    _H5_HANDLE_CAP = 128
+
     def __init__(
         self,
         datadir: Union[str, Path],
@@ -54,6 +60,7 @@ class APASparseDataset(Dataset):
         cache_dir: Union[str, Path] = "./data",
         view_ranges: Optional[Dict[str, Tuple[int, int]]] = None,
         frame_name: str = "frame_rebinned_reco",
+        apply_log_transform: bool = True,
     ):
         """
         Args:
@@ -101,11 +108,42 @@ class APASparseDataset(Dataset):
             / f"APASparseDataset_APA{self.apa}_view{self.view}_{root_hash}_cache.pt"
         )
 
+        self.apply_log_transform = bool(apply_log_transform)
+
+        # Worker-local h5py handle cache (initialised lazily; survives fork).
+        self._h5_cache: "OrderedDict[str, h5py.File]" = OrderedDict()
+
         self.samples: List[APASampleIndex] = self._scan()
         if not self.samples:
             raise RuntimeError(
                 f"No sparse samples found under {self.datadir} for APA {self.apa}"
             )
+
+    # -------------------------
+    # h5py handle cache (per-worker)
+    # -------------------------
+
+    def _h5(self, path: Path) -> h5py.File:
+        """Return a cached open h5py.File for `path`, evicting LRU as needed.
+
+        Workers fork from the main process; opening h5py handles here (lazily
+        on first __getitem__ call per worker) keeps each worker's cache
+        independent and avoids the cross-fork file-descriptor issue.
+        """
+        key = str(path)
+        f = self._h5_cache.get(key)
+        if f is not None:
+            self._h5_cache.move_to_end(key)
+            return f
+        f = h5py.File(path, "r")
+        self._h5_cache[key] = f
+        if len(self._h5_cache) > self._H5_HANDLE_CAP:
+            _, oldest = self._h5_cache.popitem(last=False)
+            try:
+                oldest.close()
+            except Exception:
+                pass
+        return f
 
     # -------------------------
     # cache helpers
@@ -175,10 +213,10 @@ class APASparseDataset(Dataset):
     def __getitem__(self, idx: int) -> Voxels:
         s = self.samples[idx]
 
-        with h5py.File(s.path, "r") as f:
-            frame = f[s.group][self.frame_name]
-            coords = torch.from_numpy(frame["coords"][()]).to(torch.int32)   # (N, 2)
-            feats  = torch.from_numpy(frame["features"][()]).to(torch.float32)  # (N,)
+        f = self._h5(s.path)
+        frame = f[s.group][self.frame_name]
+        coords = torch.from_numpy(frame["coords"][()]).to(torch.int32)   # (N, 2)
+        feats  = torch.from_numpy(frame["features"][()]).to(torch.float32)  # (N,)
 
         # select view: keep only active pixels in [ch_start, ch_end)
         mask = (coords[:, 0] >= self.ch_start) & (coords[:, 0] < self.ch_end)
@@ -187,6 +225,12 @@ class APASparseDataset(Dataset):
 
         # rebase channel coordinate to 0 for this view
         coords[:, 0] -= self.ch_start
+
+        # Apply log1p on CPU here so the GPU side never has to (rec #A.3,
+        # mirrors polarmae's CPU log-transform).  Saves a kernel launch per
+        # batch and overlaps with the next worker prefetch.
+        if self.apply_log_transform:
+            feats = torch.log1p(feats)
 
         # features must be (N, C) for Voxels
         feats = feats.unsqueeze(1)
