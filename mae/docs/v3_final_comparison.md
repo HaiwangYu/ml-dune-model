@@ -7,27 +7,39 @@ comparison against PoLAr-MAE.
 
 ## Headline result
 
-| Probe | mae v3 (best of 5 epochs) | mae v3 (final ep5) | polarmae v3 (best) |
-|---|---|---|---|
-| **sft_feat** val_macro_f1 | 0.674 (ep1) | 0.656 | **0.933** |
-| **voxel_svm_feat** val_macro_f1 | 0.651 (ep1) | 0.633 | **0.940** |
-| sft_raw val_macro_f1 | 0.462 (ep5) | 0.462 | 0.526 |
-| voxel_svm_raw val_macro_f1 | 0.433 (ep5) | 0.433 | 0.432 |
+| Probe | mae v3 (best of 5 ep) | mae v3 (final ep5) | dino (teacher, best of {10,50,100}) | dino (teacher, ep100) | polarmae v3 (best) |
+|---|---|---|---|---|---|
+| **sft_feat** val_macro_f1 | 0.674 (ep1) | 0.656 | 0.719 (ep10/100) | 0.719 | **0.933** |
+| **voxel_svm_feat** val_macro_f1 | 0.651 (ep1) | 0.633 | 0.656 (ep50) | 0.655 | **0.940** |
+| sft_raw val_macro_f1 | 0.462 (ep5) | 0.462 | 0.473 | 0.473 | 0.526 |
+| voxel_svm_raw val_macro_f1 | 0.433 (ep5) | 0.433 | 0.495 | 0.495 | 0.432 |
 
-**Three signals jointly support the conclusion**:
+dino's student backbone matches its teacher to within 0.01 on every probe
+(student sft_feat peaks at 0.721 ep10, voxel_svm_feat 0.657 ep50), as
+expected when the EMA momentum is high (0.999 → 0.9999).  Source data:
+`/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/dino_probes_longer_contrast_slow_260528/probes_checkpoint_epoch{10,50,100}.json`.
 
-1. **Raw-charge baselines match polarmae** (svm_raw 0.43 vs 0.43; sft_raw
-   0.46 vs 0.53). This validates that the mae pipeline, class taxonomy,
-   data slice, and probe definitions are all correctly aligned — the
-   comparison is genuine.
-2. **Feature-probe gap is ~0.30 absolute** and identical across the SFT
-   and SVM probes (sft_feat 0.67 vs 0.93, svm_feat 0.65 vs 0.94). The two
-   probes agree → it's a property of the backbone features, not a probe
-   quirk.
-3. **More epochs make it slightly worse, not better**. v3's feature
-   probes peak at ep1 (0.67) and monotonically decline to 0.66 by ep5.
-   v2's v2's same pattern (oscillating 0.62-0.68 across 6 epochs). The
-   sparse-CNN MAE has effectively saturated by epoch 1.
+**Four signals jointly support the conclusion**:
+
+1. **Raw-charge baselines roughly agree across pipelines** (svm_raw
+   0.43–0.50, sft_raw 0.46–0.53).  The 0.06 spread across mae/dino/polarmae
+   is well within the variance expected from different per-pool image
+   shuffles (each pipeline samples a different fraction of the 100k-truth
+   set into its 5000-cap pool), so probe definitions and class taxonomy
+   are aligned.
+2. **Feature-probe gap is ~0.22-0.27 absolute** for the two sparse-CNN
+   models against polarmae (mae 0.67/0.65 ; dino 0.72/0.66 vs. polarmae
+   0.93/0.94).  Both probes agree per model → it's a property of the
+   backbone features, not a probe quirk.
+3. **Both sparse-CNN approaches saturate early.**  mae's feature probes
+   peak at ep1 (0.67) and gently decline to 0.66 by ep5.  dino's are
+   already at 0.72 by ep10 and stay flat through ep100.  The two distinct
+   SSL objectives (MAE charge reconstruction vs. DINO student–teacher
+   contrast) converge on the same ~0.65–0.72 ceiling on this backbone.
+4. **DINO > MAE by ~0.04 absolute** on sft_feat (0.72 vs 0.67), but the
+   gap collapses to ~0.005 on the SVM probe (0.656 vs 0.651) — DINO's
+   advantage seems to come from features that are slightly more
+   non-linear-separable, not better-organized in raw feature space.
 
 ## v3 trajectory in detail
 

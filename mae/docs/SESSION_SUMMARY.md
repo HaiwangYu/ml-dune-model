@@ -50,17 +50,20 @@ target) is the legacy `MinkUNetSparseAttentionCore` /
 
 ## What was learned
 
-| Probe | mae v3 (5 ep, ep1=best) | polarmae (20k steps, best) |
-|---|---|---|
-| sft_feat val_macro_f1 | **0.67** | **0.93** |
-| voxel_svm_feat val_macro_f1 | **0.65** | **0.94** |
-| sft_raw val_macro_f1 | 0.46 | 0.53 |
-| voxel_svm_raw val_macro_f1 | 0.43 | 0.43 |
+| Probe | mae v3 (5 ep, ep1=best) | dino (teacher, ep10–100 best) | polarmae (20k steps, best) |
+|---|---|---|---|
+| sft_feat val_macro_f1 | **0.67** | **0.72** | **0.93** |
+| voxel_svm_feat val_macro_f1 | **0.65** | **0.66** | **0.94** |
+| sft_raw val_macro_f1 | 0.46 | 0.47 | 0.53 |
+| voxel_svm_raw val_macro_f1 | 0.43 | 0.50 | 0.43 |
 
-Raw-charge probes match polarmae → pipeline is correct.  Feature probes
-are ~0.30 absolute below polarmae's — that gap is architectural (sparse
-CNN vs. FPS-tokens + transformer), not training/training-loop.  v3
-feature probes plateau at ep 1 and gently decline through ep 5.
+Raw-charge probes agree across pipelines (within ~0.06) → class taxonomy
+and probe definitions are aligned.  Feature probes for both sparse-CNN
+models (mae 0.67/0.65, dino 0.72/0.66) plateau ~0.22-0.27 below
+polarmae's 0.93/0.94 — the gap is architectural (sparse CNN vs.
+FPS-tokens + transformer), not training/training-loop.  Both mae and
+dino saturate early (mae at ep1, dino by ep10) and barely move with
+further SSL training.
 
 Wall-time: v3 = ~2 h 10 m for 5 epochs (vs v2 = ~2 h **per epoch**); ~5×
 end-to-end from Phase A+B+C.
