@@ -41,6 +41,69 @@ expected when the EMA momentum is high (0.999 → 0.9999).  Source data:
    advantage seems to come from features that are slightly more
    non-linear-separable, not better-organized in raw feature space.
 
+## How the 4 probes are computed
+
+The 4 rows are 4 different probe classifiers on the same pixel-level
+3-class task (track / shower / other).  The probe code is byte-identical
+across architectures (mae's `_run_offline_sft` and dino's
+`run_probes.py` call the same helpers); only the line that produces the
+64-d feature changes.
+
+### Shared task setup
+
+- **Data:** `prod-jay-100k-truth-2026-02-27` (~100 k truth-labeled events,
+  APA 0, view W).
+- **Labels:** per-voxel PDG → 3 classes via `pdg_to_pixel_class`:
+  - **track**: μ±, p, π±
+  - **shower**: e±, plus γ pixels in large connected-components (> 30 px
+    in the γ + e graph)
+  - **other**: small γ clusters (blips) + everything else (PDG 0 voxels
+    are masked out)
+- **Split:** image-level 80/20 with `seed=0`.
+- **Pool:** per-class-capped sampling of 5000 voxels/class for both
+  train and val pools → 15 k voxels each.  Drains the loader until all
+  classes hit the cap.
+- **Metric:** `val_macro_f1` = mean of per-class F1 over the val pool.
+
+### The 4 rows
+
+| Row | Input to classifier | Classifier head | Trained how |
+|---|---|---|---|
+| **sft_feat**       | 64-d backbone feature at each voxel (frozen backbone) | `DensePixelHead` — 3-layer MLP, 64 → 128 → 128 → 3, BN + ReLU | AdamW, 30 epochs, bs=256, lr=5e-3, wd=1e-4 |
+| **voxel_svm_feat** | same 64-d backbone feature | `sklearn.LinearSVC`, `class_weight=balanced`, `C=1.0`, `max_iter=2000` | sklearn closed-form fit on the pool |
+| **sft_raw**        | 3-d per-voxel input `(channel, tick, log1p(charge))` — **bypasses the backbone** | same `DensePixelHead` with `in_ch=3` | same AdamW recipe |
+| **voxel_svm_raw**  | same 3-d raw input | same `LinearSVC` | same fit |
+
+### What each row tells you
+
+- **`sft_feat` vs `voxel_svm_feat`** — both probe the same backbone
+  features but with different decision boundaries.  `sft_feat` (MLP)
+  measures whether the features carry enough info to be *non-linearly*
+  separated; `voxel_svm_feat` measures whether they're *linearly*
+  separable.  If both are high → features are well-organized.  If MLP
+  is higher than SVM → signal is there but tangled.  In our table:
+  dino-feat MLP (0.72) > SVM (0.66) by 0.06 → dino features need a
+  non-linear head; polarmae's two are tied at 0.93/0.94 → linearly
+  separable already.
+
+- **`*_raw` rows are the floor.**  They don't see the backbone at all.
+  They tell you what fraction of the task can be solved from
+  `(position, log_charge)` alone (svm_raw ≈ 0.43–0.50: about half).
+  The *gap* `sft_feat − sft_raw` is what the backbone buys you:
+  polarmae +0.40 abs, dino +0.25, mae +0.21.
+
+### What's "per architecture"
+
+| Arch | Feature source for sft_feat / svm_feat |
+|---|---|
+| **mae v3**  | `MinkUNetSparseAttentionCore(voxels)` — sparse U-Net + bottleneck attention.  Trained with MAE reconstruction loss on charge. |
+| **dino**    | same `MinkUNetSparseAttentionCore`, but trained with EMA student/teacher contrastive loss (no reconstruction).  Two variants (student, teacher); EMA momentum 0.999 → 0.9999 makes them ≈ identical (within 0.01). |
+| **polarmae** | FPS-tokenizer (256 groups of 32 NN) → ViT-Small (6 blocks × 384-d) → per-voxel features.  Trained with Chamfer reconstruction on point coords + log-energy of masked groups. |
+
+So comparing `sft_feat` across columns is a direct comparison of the
+**representations** these three SSL methods learn, with everything
+downstream of the backbone held fixed.
+
 ## v3 trajectory in detail
 
 5 SSL epochs on the **same data slice polarmae uses** (1M dataset
