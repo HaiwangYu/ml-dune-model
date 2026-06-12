@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Methodology — mae / dino / polarmae comparison</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+           max-width: 980px; margin: 32px auto; padding: 0 24px; line-height: 1.55;
+           color: #1a1a1a; }
+    h1 { border-bottom: 2px solid #333; padding-bottom: 6px; }
+    h2 { margin-top: 36px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+    h3 { margin-top: 22px; color: #444; }
+    code, pre { font-family: "SF Mono", Consolas, Menlo, monospace; }
+    code { background: #f2f2f2; padding: 1px 5px; border-radius: 3px; font-size: 0.95em; }
+    pre { background: #f7f7f7; padding: 10px 14px; border-radius: 6px; overflow-x: auto;
+          font-size: 0.88em; line-height: 1.4; border: 1px solid #e2e2e2; }
+    table { border-collapse: collapse; margin: 12px 0; }
+    th, td { border: 1px solid #bbb; padding: 6px 12px; text-align: left; vertical-align: top; }
+    th { background: #f0f0f0; }
+    .arch { border-left: 4px solid; padding-left: 16px; margin: 16px 0; }
+    .mae      { border-color: #2b7cbf; }
+    .dino     { border-color: #e08c2a; }
+    .polarmae { border-color: #57a356; }
+    .small { font-size: 0.9em; color: #555; }
+    .caveat { background: #fff7e0; border: 1px solid #e0c66c; padding: 12px 16px;
+              border-radius: 6px; margin: 16px 0; }
+    .path { color: #5c2d91; }
+  </style>
+</head>
+<body>
+
+<h1>Comparison methodology: mae vs dino vs polarmae</h1>
+
+<p class="small">
+  How the four-row metric table in
+  <code>mae/docs/v3_final_comparison.md</code> was produced for each of the
+  three SSL pipelines. Each section names the runs, scripts, and outputs that
+  generated the numbers.
+</p>
+
+<h2>1. Shared task setup</h2>
+
+<p>
+  Every probe in the comparison evaluates the <strong>same pixel-level
+  3-class task</strong> (track / shower / other) on the
+  <strong>same dataset slice</strong>. Only the feature source (the trained
+  backbone) varies per architecture.
+</p>
+
+<table>
+  <tr><th>Aspect</th><th>Value</th></tr>
+  <tr><td>Probe dataset</td>
+      <td><code>/gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27</code> (~100k truth-labelled events; APA 0; view W)</td></tr>
+  <tr><td>Per-pixel label mapping</td>
+      <td><code>pdg_to_pixel_class()</code> — PDG → {track, shower, other} with γ pixels split via connected-component analysis (γ + e<sup>±</sup> graph; clusters &le; 30 px → "other" blip)</td></tr>
+  <tr><td>Train / val split</td>
+      <td>Image-level random 80 / 20 with <code>seed=0</code></td></tr>
+  <tr><td>Probe pool size</td>
+      <td>5000 voxels/class for train <em>and</em> val (15 k per pool). Drained from the loader until each class hits the cap.</td></tr>
+  <tr><td>Metric</td>
+      <td><code>val_macro_f1</code> — mean of per-class F1 on the val pool</td></tr>
+</table>
+
+<h3>The four probe rows</h3>
+
+<table>
+  <tr><th>Row</th><th>Input</th><th>Classifier</th><th>Trained how</th></tr>
+  <tr><td><code>sft_feat</code></td><td>64-d (mae, dino) or 384-d (polarmae) backbone feature at each voxel (frozen backbone)</td><td>3-layer MLP (mae/dino) or 2-layer MLP (polarmae)</td><td>AdamW 30 epochs, bs=256, lr=5e-3</td></tr>
+  <tr><td><code>voxel_svm_feat</code></td><td>same backbone feature</td><td><code>sklearn.LinearSVC</code>, <code>C=1.0</code>, <code>class_weight="balanced"</code></td><td>closed-form fit</td></tr>
+  <tr><td><code>sft_raw</code></td><td>per-voxel raw input (<em>bypasses the backbone</em>): mae/dino use <code>(channel, tick, log1p(charge))</code>; polarmae uses <code>(ch_centered_scaled, tick_centered_scaled, 0, log_charge_norm)</code></td><td>same MLP head</td><td>same AdamW recipe</td></tr>
+  <tr><td><code>voxel_svm_raw</code></td><td>same raw input</td><td>same <code>LinearSVC</code></td><td>same fit</td></tr>
+</table>
+
+<h3>Probe independence (no weight sharing)</h3>
+
+<p>
+  Every probe is <strong>freshly initialized and trained from scratch</strong>.
+  No weights are shared, in any direction:
+</p>
+
+<ul>
+  <li><strong>Within one architecture</strong>, the four probes
+      (<code>sft_feat</code>, <code>sft_raw</code>, <code>voxel_svm_feat</code>,
+      <code>voxel_svm_raw</code>) are four separate classifiers with their own
+      weights. The MLP heads do not share with each other, the SVMs do not
+      share with each other, and the MLPs do not share with the SVMs.</li>
+  <li><strong>Across architectures</strong>, mae's MLP, dino's MLP, and
+      polarmae's MLP are three separately-instantiated heads &mdash; each
+      trained only on its own backbone's features.</li>
+  <li><strong>Across mae's SSL epochs</strong>, a fresh
+      <code>DensePixelHead</code> is constructed at every epoch boundary &mdash;
+      no carry-over from one epoch's probe to the next. (This is why mae's
+      per-epoch trajectory is a noisy line, not a monotonically-improving
+      curve.)</li>
+  <li>The <strong>only thing the four probes share</strong>, within a single
+      architecture's evaluation, is the <em>probe pool</em> itself
+      (5000/class &times; 3 = 15 k voxels). All four probes read from the
+      same pool so that the four numbers describe four orthogonal cuts
+      through the same data, not four different sample draws.</li>
+</ul>
+
+<p>Concretely, in the code:</p>
+
+<pre># mae   - mae/scripts/train_mae.py:_fit_dense_head
+torch.manual_seed(seed)
+head = DensePixelHead(in_ch=X.shape[1], n_classes=n_classes).to(device)   # new every call
+
+# dino  - dino/diagnostics/run_probes.py:_fit_dense_head
+torch.manual_seed(seed)
+head = DensePixelHead(in_ch=X.shape[1], n_classes=n_classes).to(device)   # new every call
+
+# polarmae - polarmae/eval/probes.py:_train_head
+head = _SmallHead(X.shape[1], n_classes).to(device)                       # new every call</pre>
+
+<p class="small">
+  Likewise <code>LinearSVC(...)</code> is instantiated fresh in every SVM
+  call across all three pipelines.
+</p>
+
+<h2>2. mae — train + evaluate in one job</h2>
+
+<div class="arch mae">
+
+<p>
+  mae's probes are <strong>embedded in the training loop</strong>. Every SSL
+  epoch ends with an offline-pool SFT step that runs all four probes and
+  writes them to <code>sft_history.json</code>.
+</p>
+
+<h3>Run</h3>
+
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Run name</td><td><code>mae_full_v3_260524</code></td></tr>
+  <tr><td>Config</td><td><code>gridutils/config_mae_full_v3.json</code></td></tr>
+  <tr><td>SSL epochs</td><td>5</td></tr>
+  <tr><td>Backbone</td><td><code>MinkUNetSparseAttentionCore</code> via <code>MinkUNetTrueMAECore</code> (true-MAE coord removal)</td></tr>
+  <tr><td>Output path</td><td><span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/mae_full_v3_260524/</span></td></tr>
+</table>
+
+<h3>Scripts run (end-to-end)</h3>
+
+<pre>cd /lbne/u/hyu/ml-dune-model
+bash gridutils/submit_mae.sh gridutils/config_mae_full_v3.json</pre>
+
+<p class="small">Under the hood this writes a Condor <code>.sub</code> and invokes:</p>
+
+<ol>
+  <li><code>gridutils/submit_mae.sh</code> — submitter (sets memory / GPU / scratch).</li>
+  <li><code>gridutils/trainjob_mae.sh</code> — Condor worker entry. Starts
+      the periodic-rsync watchdog, the <code>nvidia-smi</code> logger, and
+      then runs:
+      <pre>python -u -m mae.scripts.train_mae from_config \
+    --config_path=gridutils/config_mae_full_v3.json \
+    --checkpoints_dir=$SCRATCH/checkpoints \
+    --debug_dir=$SCRATCH/debug \
+    --viz_dir=$SCRATCH/viz \
+    --device=cuda</pre>
+  </li>
+  <li>Inside <code>mae/scripts/train_mae.py</code>, after each SSL epoch:
+      <code>_run_offline_sft(model, sft_train_loader, sft_val_loader, ...)</code>
+      &mdash; pools features once and runs the four probes
+      (<code>_collect_sft_pool</code> &rarr; <code>_fit_dense_head</code> for
+      sft_feat/sft_raw &rarr; <code>_fit_svm_on_pool</code> for the SVMs).</li>
+</ol>
+
+<h3>Where the numbers come from</h3>
+
+<p>
+  <code>debug/sft_history.json</code> &mdash; one entry per SSL epoch, each
+  with the four probe blocks (<code>sft_feat</code>, <code>sft_raw</code>,
+  <code>voxel_svm_feat</code>, <code>voxel_svm_raw</code>), each containing
+  <code>train_acc</code>, <code>val_acc</code>, <code>val_macro_f1</code>,
+  confusion matrix, per-class efficiency / purity.
+</p>
+
+</div>
+
+<h2>3. dino — re-evaluate existing checkpoints</h2>
+
+<div class="arch dino">
+
+<p>
+  dino was already trained by <code>mvicenzi</code>. We did <strong>not</strong>
+  re-train. Instead, we wrote a standalone probe script that loads each
+  saved checkpoint and applies the same probe suite mae uses.
+</p>
+
+<h3>Inputs</h3>
+
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Checkpoints</td>
+      <td><span class="path">/gpfs01/lbne/users/fm/mvicenzi/CONDOR_OUT/longer_contrast_slow/checkpoints/</span>
+          &mdash; we evaluated <code>checkpoint_epoch{10,50,100}.pt</code></td></tr>
+  <tr><td>Backbone</td>
+      <td><code>MinkUNetSparseAttentionCore</code> (same as mae, but trained with the DINO contrast objective)</td></tr>
+  <tr><td>Probe-evaluation run name</td>
+      <td><code>dino_probes_longer_contrast_slow_260528</code></td></tr>
+  <tr><td>Output path</td>
+      <td><span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/dino_probes_longer_contrast_slow_260528/</span></td></tr>
+</table>
+
+<h3>Scripts written for this evaluation</h3>
+
+<ul>
+  <li><code>dino/diagnostics/run_probes.py</code> &mdash; new. For a given
+      checkpoint, loads dino's student + teacher backbones, builds a streaming
+      per-class pool of 5000 voxels/class (capped on the fly to keep memory
+      bounded), applies the <code>FeatureLogTransform(3.75, 83861.2)</code>
+      normalizer that dino was trained with, then runs the same four probes
+      on both the student and the teacher feature.</li>
+  <li><code>gridutils/probe_dino.sh</code> &mdash; Condor worker. Loops over
+      a list of checkpoints in one allocation.</li>
+  <li><code>gridutils/submit_probe_dino.sh</code> &mdash; submitter. Defaults
+      to the three checkpoints above.</li>
+</ul>
+
+<h3>Scripts run</h3>
+
+<pre>cd /lbne/u/hyu/ml-dune-model
+REQUEST_MEMORY=48000 bash gridutils/submit_probe_dino.sh
+# Condor cluster 333.0 ran probe_dino.sh, which for each checkpoint invoked:
+python -u -m dino.diagnostics.run_probes \
+    --checkpoint=$CKPT \
+    --output=$CKPT_DIR/probes_$BASENAME.json \
+    --batch_size=32 \
+    --num_workers=4 \
+    --cap_per_class=5000 \
+    --val_frac=0.2 \
+    --epochs=30 \
+    --device=cuda</pre>
+
+<h3>Where the numbers come from</h3>
+
+<p>
+  Three JSONs, one per checkpoint:
+  <code>probes_checkpoint_epoch10.json</code>,
+  <code>probes_checkpoint_epoch50.json</code>,
+  <code>probes_checkpoint_epoch100.json</code>.
+  Each has two views (<code>student</code>, <code>teacher</code>), each with
+  the four probe blocks (<code>sft_feat</code> / <code>sft_raw</code> /
+  <code>voxel_svm_feat</code> / <code>voxel_svm_raw</code>) &mdash; same
+  schema as one entry of mae's <code>sft_history.json</code>.
+</p>
+
+<h3>Implementation notes</h3>
+
+<ol>
+  <li><strong>State-dict format mismatch.</strong> dino was trained when
+      <code>attn_default</code> in <code>BACKBONE_REGISTRY</code> resolved to
+      <code>MinkUNetSparseAttentionCore</code>. The registry has since been
+      refactored to wrap the core in a dense input/output adapter
+      (<code>MinkUNetSparseAttention</code>), so checkpoint keys
+      (<code>conv0.0.weight</code>, &hellip;) no longer match the wrapper's
+      keys (<code>core.conv0.0.weight</code>, &hellip;). The loader sniffs the
+      first key and loads directly into the Core class when the prefix is
+      absent.</li>
+  <li><strong>Streaming pool.</strong> A naive
+      "collect-everything-then-pool" approach hit a 32 GB OOM
+      (~60 GB needed per view at 80k images &times; ~3k voxels &times; 64-d
+      float32). We rewrote the pool builder to drain the loader, classify
+      pixels per-image, and append to the per-class pool only while it has
+      room. Peak memory ~ 10 MB regardless of dataset size; per checkpoint
+      runs in &lt; 1 min once classes saturate.</li>
+</ol>
+
+</div>
+
+<h2>4. polarmae — probes run as a Lightning callback during training</h2>
+
+<div class="arch polarmae">
+
+<p>
+  polarmae lives in a separate repo
+  (<span class="path">/lbne/u/hyu/PoLAr-MAE/</span>). Its probes are
+  registered as a Lightning <code>APA2DProbeCallback</code> and fire on
+  validation epoch ends &mdash; so there is no separate probe-evaluation job
+  for polarmae. The numbers in the table come directly from the training
+  run's saved JSON snapshots.
+</p>
+
+<h3>Run</h3>
+
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Run name</td><td><code>polarmae_apa2d_full_260523_v3</code></td></tr>
+  <tr><td>Trainer config</td>
+      <td><span class="path">/lbne/u/hyu/PoLAr-MAE/configs/polarmae_apa2d_full.yml</span></td></tr>
+  <tr><td>Encoder</td>
+      <td>vit_small (embed_dim=384, depth=12, num_heads=6) over FPS-tokens (256 patches of 32 nearest neighbours, ball-query group_radius&nbsp;=&nbsp;1/120 in normalized coords)</td></tr>
+  <tr><td>Loss</td><td>Chamfer + per-voxel energy reconstruction on masked patches</td></tr>
+  <tr><td>Steps</td><td>~20 000</td></tr>
+  <tr><td>Output path</td>
+      <td><span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/polarmae_apa2d_full_260523_v3/</span></td></tr>
+</table>
+
+<h3>Scripts run</h3>
+
+<p>From the PoLAr-MAE repo:</p>
+
+<pre>cd /lbne/u/hyu/PoLAr-MAE
+bash gridutils/submit_polarmae.sh configs/polarmae_apa2d_full.yml</pre>
+
+<p>That launches the PyTorch-Lightning trainer. The
+<code>APA2DProbeCallback</code> is attached in the config and runs every
+N steps, writing <code>probes_step{N}.json</code> into the
+<code>probes/</code> subdirectory.</p>
+
+<h3>How polarmae turns per-patch tokens into per-voxel features</h3>
+
+<p>
+  vit_small produces 256 patch tokens of dim 384. The probe needs a
+  feature <em>per voxel</em>, so
+  <code>_extract_per_voxel_features()</code> performs an
+  <strong>inverse-distance K-NN upsample</strong> from the FPS centers:
+</p>
+
+<pre>K = min(5, T)                                              # K=5 nearest tokens
+dists, idx, _ = knn_points(xyz_pts, centers, K=K)          # voxel -> nearest FPS centers
+weight = 1.0 / (dists + eps)
+weight = weight / weight.sum(dim=2, keepdim=True)          # normalised softmax-of-distance
+voxel_feats = (gathered_tokens * weight).sum(dim=2)        # (B, N, 384) per voxel</pre>
+
+<p>
+  So each voxel's 384-d feature is the inverse-distance weighted average of
+  the 5 nearest patch-token embeddings. The probe MLP / SVM then sees
+  (N&nbsp;voxels, 384) &mdash; same interface as the mae and dino paths.
+</p>
+
+<h3>Where the numbers come from</h3>
+
+<p>
+  <code>probes/probes_step{N}.json</code> &mdash; the "best" column in the
+  comparison table is the max <code>val_macro_f1</code> across all step
+  snapshots for each probe.
+</p>
+
+</div>
+
+<h2>5. Headline result</h2>
+
+<table>
+  <tr><th>Probe</th>
+      <th>mae v3 (best of 5 ep)</th>
+      <th>mae v3 (final ep5)</th>
+      <th>dino (teacher, best of {10,50,100})</th>
+      <th>dino (teacher, ep100)</th>
+      <th>polarmae v3 (best)</th></tr>
+  <tr><td><code>sft_feat</code></td>
+      <td>0.674 (ep1)</td><td>0.656</td>
+      <td>0.719 (ep10/100)</td><td>0.719</td>
+      <td><strong>0.933</strong></td></tr>
+  <tr><td><code>voxel_svm_feat</code></td>
+      <td>0.651 (ep1)</td><td>0.633</td>
+      <td>0.656 (ep50)</td><td>0.655</td>
+      <td><strong>0.940</strong></td></tr>
+  <tr><td><code>sft_raw</code></td>
+      <td>0.462 (ep5)</td><td>0.462</td>
+      <td>0.473</td><td>0.473</td>
+      <td>0.526</td></tr>
+  <tr><td><code>voxel_svm_raw</code></td>
+      <td>0.433 (ep5)</td><td>0.433</td>
+      <td>0.495</td><td>0.495</td>
+      <td>0.432</td></tr>
+</table>
+
+<p>dino's student backbone matches its teacher to within 0.01 on every
+probe (student <code>sft_feat</code> peaks at 0.721 ep10,
+<code>voxel_svm_feat</code> 0.657 ep50).</p>
+
+<h2>6. Caveats / non-equivalences across pipelines</h2>
+
+<div class="caveat">
+
+<p>
+  The probes are <strong>byte-identical between mae and dino</strong> (they
+  share <code>DensePixelHead</code>, the same <code>LinearSVC</code> call,
+  the same <code>_collect_*_pool</code> semantics). They are
+  <strong>not</strong> byte-identical to polarmae's implementation:
+</p>
+
+<ul>
+  <li><strong>Different raw-feature scaling.</strong> mae and dino use
+      <code>(channel_int, tick_int, log1p(charge))</code>; polarmae uses
+      <code>((ch - 525)/600, (tick - 562)/600, 0, log_charge_in_[-1,+1])</code>.
+      Same information content (the constant 0 channel is degenerate), but
+      different scales &rArr; different SVM / MLP convergence.</li>
+  <li><strong>Different probe MLP head.</strong> mae/dino:
+      <code>DensePixelHead</code> &mdash; 3-layer (in &rarr; 128 &rarr; 128 &rarr; 3),
+      BN + ReLU, plain CE. polarmae: <code>_SmallHead</code> &mdash;
+      2-layer (in &rarr; 128 &rarr; 3), GELU, inverse-frequency class-weighted CE.</li>
+  <li><strong>Different image splits.</strong> mae/dino use
+      <code>torch.randperm(seed=0)</code> on the 100k-truth dataset for
+      train / val. polarmae uses two explicit dataset paths
+      (<code>probe_data_path</code>, <code>probe_val_data_path</code>) which
+      may not coincide with mae's split.</li>
+  <li><strong>Different per-class pool composition.</strong> Within each
+      cap of 5000, the specific voxels depend on iteration order, which
+      differs across pipelines (different batch size, different sampler).</li>
+</ul>
+
+<p>
+  Net effect: the <strong>raw rows</strong>
+  (<code>sft_raw</code>, <code>voxel_svm_raw</code>) span ~0.06 absolute
+  across pipelines (0.43-0.53). This spread is preprocessing noise, not a
+  property of the architectures. The meaningful per-pipeline signal is the
+  <em>gap</em> <code>sft_feat</code>&nbsp;&minus;&nbsp;<code>sft_raw</code> &mdash; what the
+  backbone is buying you on top of raw position+charge.
+</p>
+
+<table>
+  <tr><th>Architecture</th><th>sft_feat &minus; sft_raw</th></tr>
+  <tr><td>polarmae</td><td>+0.41 (0.933 &minus; 0.526)</td></tr>
+  <tr><td>dino (teacher)</td><td>+0.25 (0.719 &minus; 0.473)</td></tr>
+  <tr><td>mae v3</td><td>+0.21 (0.674 &minus; 0.462)</td></tr>
+</table>
+
+</div>
+
+<h2>7. Output artifacts (where to look)</h2>
+
+<table>
+  <tr><th>Pipeline</th><th>Run dir on GPFS</th><th>Probe JSON(s)</th></tr>
+  <tr><td>mae v3</td>
+      <td><span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/mae_full_v3_260524/</span></td>
+      <td><code>debug/sft_history.json</code> (5 epochs &times; 4 probes)</td></tr>
+  <tr><td>dino</td>
+      <td><span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/dino_probes_longer_contrast_slow_260528/</span></td>
+      <td><code>probes_checkpoint_epoch{10,50,100}.json</code></td></tr>
+  <tr><td>polarmae</td>
+      <td><span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/polarmae_apa2d_full_260523_v3/</span></td>
+      <td><code>probes/probes_step*.json</code></td></tr>
+</table>
+
+<h2>8. Reproducing the comparison from scratch</h2>
+
+<pre># 1. mae (trains + probes in one job, ~2h 10m on L40S)
+bash gridutils/submit_mae.sh gridutils/config_mae_full_v3.json
+
+# 2. dino (only probes; uses mvicenzi's checkpoints, ~3 min on L40S)
+REQUEST_MEMORY=48000 bash gridutils/submit_probe_dino.sh
+
+# 3. polarmae (from the PoLAr-MAE repo; trains + probes; ~few hours)
+cd /lbne/u/hyu/PoLAr-MAE
+bash gridutils/submit_polarmae.sh configs/polarmae_apa2d_full.yml</pre>
+
+<p class="small">
+  After all three complete, parse the relevant JSONs (see Section 7) and
+  fill in the table. mae's <code>sft_history.json</code> is the canonical
+  schema; dino's per-checkpoint JSON and polarmae's per-step JSON both
+  contain one entry of that schema (plus a <code>views</code> wrapper for
+  dino's student / teacher).
+</p>
+
+</body>
+</html>
