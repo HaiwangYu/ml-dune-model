@@ -118,6 +118,30 @@ N=2000→26 MiB, 4000→49, 6000→78, 8000→114 (≈13 MiB per 1000 pixels).
   is **scaling headroom** (§3), which only pays off at token counts far above
   this task's ~144–256.
 
+## 3b. CPU inference (deployment target)
+
+Same per-event forward, on CPU (4 threads, 16 real events, ~160 tokens).
+Memory = peak process RSS (`/proc/self/statm`).
+
+| Model | runs on CPU? | latency (ms/event) | peak RSS (MiB) |
+|---|---|---|---|
+| mae / dino (sparse-CNN) | **NO — GPU-only** | — | — |
+| polarmae (attention) | yes | **516** | 791 |
+| larmamba (Mamba, pure-torch scan) | yes | 4537 | 872 |
+
+- **mae/dino cannot run on CPU at all**: WarpConvNet's sparse hashmap asserts
+  `coords must be on CUDA`. The lightest GPU model has *no* CPU path.
+- **larmamba runs on CPU** (via the pure-torch scan fallback) — but at this
+  token scale (~160) it is **~9× slower than polarmae's attention** and
+  slightly heavier. The pure-torch selective scan (python chunk loop +
+  Hillis-Steele passes) is the bottleneck; attention on CPU is BLAS-bound and
+  fast at small T.
+- So for **CPU deployment**: larmamba's edge over mae/dino is simply that it
+  *runs* (and at polarmae accuracy); it is **not** faster/lighter than polarmae
+  on CPU here. larmamba's linear-time advantage would only surface on CPU at
+  token counts far larger than this task's. A sequential-scan CPU path (or a
+  numba/Triton-CPU kernel) is the obvious optimization if CPU latency matters.
+
 ## 4. Interpretation / where this matters
 
 - **Quality goal met**: larmamba is a polarmae-quality 2D-LArTPC foundation

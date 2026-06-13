@@ -173,6 +173,23 @@ is <em>not</em> cheaper here. larmamba does <strong>not</strong> beat mae/dino o
 is <strong>accuracy</strong> (polarmae-level, +0.25 over sparse-CNN); its win over PoLAr-MAE is
 <strong>scaling headroom</strong> (§5), which only pays off well above this task's ~144–256 tokens.</div>
 
+<h2>5b. CPU inference (deployment target)</h2>
+<p>Same per-event forward on CPU (4 threads, 16 real events, ~160 tokens); memory = peak process RSS.</p>
+<table>
+<tr><th>Model</th><th>runs on CPU?</th><th>latency (ms/event)</th><th>peak RSS (MiB)</th></tr>
+<tr><td>mae / dino (sparse-CNN)</td><td><b>NO — GPU-only</b></td><td>—</td><td>—</td></tr>
+<tr><td>polarmae (attention)</td><td>yes</td><td class="win">516</td><td>791</td></tr>
+<tr><td>larmamba (Mamba, pure-torch scan)</td><td>yes</td><td>4537</td><td>872</td></tr>
+</table>
+<div class="caveat">
+<strong>mae/dino cannot run on CPU at all</strong> — WarpConvNet's sparse hashmap asserts
+<code>coords must be on CUDA</code>; the lightest GPU model has no CPU path. <strong>larmamba does run on
+CPU</strong> (pure-torch scan fallback) at polarmae accuracy, but at this token scale (~160) it is ~9×
+<em>slower</em> than polarmae's attention (the pure-torch selective scan is the bottleneck; attention is
+BLAS-bound and fast at small T). So for CPU deployment, larmamba's edge over mae/dino is that it
+<em>runs</em>; it is not faster/lighter than polarmae here. A sequential-scan or numba/Triton-CPU kernel
+is the obvious fix if CPU latency matters.</div>
+
 <h2>6. Conclusions</h2>
 <ul>
 <li><strong>Quality goal met</strong>: larmamba is a PoLAr-MAE-quality 2D-LArTPC foundation model. Using a
