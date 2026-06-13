@@ -1,0 +1,129 @@
+# larmamba token-sweep variant: num_init_groups=512 — bidirectional-Mamba encoder on DUNE APA wire-plane data.
+#
+# Identical recipe to PoLAr-MAE's polarmae_apa2d_full.yml EXCEPT the encoder is
+# larmamba.MambaEncoder (linear-time SSM) instead of the ViT self-attention
+# TransformerEncoder.  Reuses polarmae's tokenizer, decoder, Chamfer+energy
+# loss, training loop, and APA2DProbeCallback (the four probes).
+#
+# Run inside uvenv-polar-mae with /lbne/u/hyu/ml-dune-model on PYTHONPATH so the
+# class_path larmamba.MambaEncoder resolves.
+
+seed_everything: 0
+
+trainer:
+  sync_batchnorm: false
+  gradient_clip_val: 3
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  max_steps: 20000
+  precision: bf16-mixed
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  log_every_n_steps: 50
+  callbacks:
+    - class_path: polarmae.eval.probes.APA2DProbeCallback
+      init_args:
+        probe_data_path:     /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/00[1-8]
+        probe_val_data_path: /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/009
+        probe_batch_size: 8
+        probe_num_workers: 2
+        probe_dataset_kwargs:
+          apa: 0
+          view: W
+          emin: 1.0
+          emax: 1.0e5
+          energy_threshold: 1.0
+          min_points: 256
+          max_points: 8000
+          maxlen: -1
+          return_semantic_id: true
+        max_pixels_per_class: 5000
+        svm_C: 1.0
+        sft_epochs: 30
+        sft_batch: 256
+        sft_lr: 5.0e-3
+        train_frac: 0.8
+
+model:
+  loss_weights:
+    ae: 0.0
+    chamfer: 1.0
+    energy: 1.0
+  encoder:
+    class_path: larmamba.MambaEncoder
+    init_args:
+      num_channels: 4
+      arch: vit_small
+      voxel_size: 5
+      masking_ratio: 0.6
+      masking_type: rand
+      tokenizer_kwargs:
+        group_radius: ${eval:'${model.encoder.init_args.voxel_size} * ${model.transformation_scale_factor}'}
+        num_init_groups: 512
+        context_length: 1024
+      apply_relative_position_bias: false
+      transformer_kwargs:
+        # NOTE: attn_drop_rate / use_flash_self_attn are kept (the decoder block
+        # interpolates them) but are ignored by MambaTransformer.
+        postnorm: false
+        add_pos_at_every_layer: true
+        drop_rate: 0.0
+        attn_drop_rate: 0.05
+        drop_path_rate: 0.25
+        use_flash_self_attn: true
+      mamba_kwargs:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+  decoder:
+    class_path: polarmae.layers.decoder.TransformerDecoder
+    init_args:
+      arch: ${model.encoder.init_args.arch}
+      transformer_kwargs:
+        postnorm: true
+        depth: 4
+        add_pos_at_every_layer: ${model.encoder.init_args.transformer_kwargs.add_pos_at_every_layer}
+        drop_rate: ${model.encoder.init_args.transformer_kwargs.drop_rate}
+        attn_drop_rate: ${model.encoder.init_args.transformer_kwargs.attn_drop_rate}
+        drop_path_rate: ${model.encoder.init_args.transformer_kwargs.drop_path_rate}
+        use_flash_self_attn: ${model.encoder.init_args.transformer_kwargs.use_flash_self_attn}
+  mae_prediction: full
+
+  learning_rate: 3.5e-5
+  optimizer_adamw_weight_decay: 0.05
+  lr_scheduler_linear_warmup_epochs: 2000
+  lr_scheduler_linear_warmup_start_lr: 3e-6
+  lr_scheduler_cosine_eta_min: ${.lr_scheduler_linear_warmup_start_lr}
+  lr_scheduler_stepping: step
+  svm_validation_max_tokens: 7500
+  svm_validation_C: 0.005
+
+  train_transformations: [center_and_scale]
+  val_transformations:   [center_and_scale]
+  transformation_center: [525, 562, 0]
+  transformation_scale_factor: ${eval:'1.0 / 600.0'}
+  transformation_rotate_dims: null
+  transformation_rotate_degs: null
+  svm_validation: {}
+
+data:
+  class_path: polarmae.datasets.APA2DDataModule
+  init_args:
+    data_path:     /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27/13825/1/00[1-8]
+    val_data_path: /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27/13825/1/009
+    batch_size: 16
+    num_workers: 2
+    dataset_kwargs:
+      apa: 0
+      view: W
+      emin: 1.0
+      emax: 1.0e5
+      energy_threshold: 1.0
+      min_points: 256
+      max_points: 8000
+      maxlen: -1
+      return_semantic_id: false
+      return_cluster_id: false
+    test_dataset_kwargs:
+      maxlen: 2000
