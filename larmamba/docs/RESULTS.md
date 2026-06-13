@@ -85,6 +85,39 @@ synthetic input): Mamba was **2.6× faster** than attention at equal token
 count; peak memory there is dominated by the shared FPS/CNMS tokenizer
 (~20 GB), not the mixer.
 
+## 3a. Inference memory vs mae / dino (per event, batch=1)
+
+The question "how does larmamba's inference memory compare to mae/dino" needs a
+cross-architecture measurement, since mae/dino are sparse-CNNs (no tokenizer,
+convolve active voxels directly; ml-dune-model env / torch 2.10 / WarpConvNet)
+while larmamba/polarmae tokenize then run a transformer (polar env / torch 2.5).
+Each model's **feature-extraction forward** was measured (eval, no grad, peak
+`cuda.max_memory_allocated`). larmamba/polarmae on 32 **real** events
+(`bench_infer_real.py`, mean 3856 active pixels → mean 144 tokens); mae/dino on
+synthetic Voxels (`mae/diagnostics/bench_backbone_mem.py`).
+
+| Model | architecture | unit | **peak MiB** | latency (ms) | feat macro-F1 |
+|---|---|---|---|---|---|
+| mae   | sparse-CNN backbone | ~4k active voxels | **~49** | ~7 | 0.674 |
+| dino  | sparse-CNN backbone | ~4k active voxels | **~49** | ~7 | 0.719 |
+| polarmae | ViT-S tokenizer + attention | 144 tokens | 265 | 7.0 | 0.933 |
+| **larmamba** | tokenizer + bidirectional Mamba | 144 tokens | 285 | 23.8 | 0.940 |
+
+Sparse-CNN backbone scaling with active pixels N (batch=1):
+N=2000→26 MiB, 4000→49, 6000→78, 8000→114 (≈13 MiB per 1000 pixels).
+
+**Honest takeaway:**
+- **The sparse-CNN (mae/dino) is the lightest at inference** — ~49 MiB/event,
+  ~5× under larmamba/polarmae — because it has no tokenizer and sparse conv only
+  touches active pixels. But it pays ~0.25 macro-F1 for that.
+- **larmamba ≈ polarmae** in inference memory at the real token scale (285 vs
+  265 MiB); at these small token counts (~144) attention is actually faster and
+  marginally lighter, so Mamba is not cheaper here.
+- **larmamba does not beat mae/dino on inference memory** — its win is
+  **accuracy** (polarmae-level, +0.25 over sparse-CNN). Its win over *polarmae*
+  is **scaling headroom** (§3), which only pays off at token counts far above
+  this task's ~144–256.
+
 ## 4. Interpretation / where this matters
 
 - **Quality goal met**: larmamba is a polarmae-quality 2D-LArTPC foundation

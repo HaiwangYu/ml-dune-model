@@ -150,6 +150,29 @@ faster. Mamba's advantage is <em>scaling headroom</em>, not the current operatin
 <p class="small">End-to-end encoder benchmark (with the tokenizer): Mamba ~2.6× faster than attention at equal
 tokens; there, peak memory is dominated by the shared FPS/CNMS tokenizer (~20 GB), not the mixer.</p>
 
+<h2>5a. Inference memory vs mae / dino (per event, batch=1)</h2>
+<p>mae/dino are sparse-CNNs (no tokenizer; convolve active voxels directly; ml-dune-model env / torch 2.10
+/ WarpConvNet), so this is an architecture-level comparison. Each model's feature-extraction forward was
+measured (eval, no grad, peak <code>cuda.max_memory_allocated</code>): larmamba/polarmae on 32 <em>real</em>
+events (mean 3856 active pixels → mean 144 tokens); mae/dino on synthetic Voxels.</p>
+<table>
+<tr><th>Model</th><th>architecture</th><th>unit</th><th>peak MiB</th><th>latency ms</th><th>feat macro-F1</th></tr>
+<tr><td>mae</td><td>sparse-CNN backbone</td><td>~4k voxels</td><td class="win">~49</td><td>~7</td><td>0.674</td></tr>
+<tr><td>dino</td><td>sparse-CNN backbone</td><td>~4k voxels</td><td class="win">~49</td><td>~7</td><td>0.719</td></tr>
+<tr><td>PoLAr-MAE</td><td>ViT-S tokenizer + attention</td><td>144 tokens</td><td>265</td><td>7.0</td><td>0.933</td></tr>
+<tr><td>larmamba</td><td>tokenizer + bidirectional Mamba</td><td>144 tokens</td><td>285</td><td>23.8</td><td>0.940</td></tr>
+</table>
+<p>Sparse-CNN scaling with active pixels N (batch=1): 2000→26 MiB, 4000→49, 6000→78, 8000→114
+(~13 MiB / 1000 pixels).</p>
+<div class="caveat">
+<strong>Honest takeaway:</strong> the <strong>sparse-CNN (mae/dino) is the lightest at inference</strong>
+(~49 MiB/event, ~5× under larmamba/polarmae) — no tokenizer, conv touches only active pixels — but it
+gives up ~0.25 macro-F1. <strong>larmamba ≈ PoLAr-MAE</strong> in inference memory at the real token scale
+(285 vs 265 MiB); at these small token counts (~144) attention is even slightly faster/lighter, so Mamba
+is <em>not</em> cheaper here. larmamba does <strong>not</strong> beat mae/dino on inference memory — its win
+is <strong>accuracy</strong> (polarmae-level, +0.25 over sparse-CNN); its win over PoLAr-MAE is
+<strong>scaling headroom</strong> (§5), which only pays off well above this task's ~144–256 tokens.</div>
+
 <h2>6. Conclusions</h2>
 <ul>
 <li><strong>Quality goal met</strong>: larmamba is a PoLAr-MAE-quality 2D-LArTPC foundation model. Using a
