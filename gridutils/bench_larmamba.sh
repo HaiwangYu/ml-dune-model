@@ -9,6 +9,8 @@ echo "Running $CLUSTER_ID.$JOB_ID on $(hostname)  mode=${groups} batch=${batch}"
 "${env_prefix}/bin/python" -c "import torch;print('GPU',torch.cuda.get_device_name())"
 if [ "$groups" = "MIXER" ]; then
     "${env_prefix}/bin/python" -m larmamba.tests.bench_mixer --batch "$batch"
+elif [ "$groups" = "INFER" ]; then
+    "${env_prefix}/bin/python" -m larmamba.tests.bench_infer_real --n_events 32
 else
     "${env_prefix}/bin/python" -m larmamba.tests.bench_encoder --groups "$groups" --batch "$batch"
 fi
