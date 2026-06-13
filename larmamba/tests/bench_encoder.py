@@ -23,10 +23,16 @@ from larmamba import MambaEncoder
 
 
 def make_batch(B, Nmax, device):
+    """Synthetic points already in the model's input frame: center_and_scale
+    maps (channel,tick) via (x-center)/600, so coords land in ~[-1,1] and the
+    tokenizer's group_radius groups them into ~num_init_groups tokens (matching
+    real data).  Feeding raw 0..1500 coords degenerates grouping to 1 token/pt."""
     pts = torch.zeros(B, Nmax, 4, device=device)
     lengths = torch.full((B,), Nmax, dtype=torch.long, device=device)
-    pts[..., 0] = torch.randint(0, 1050, (B, Nmax), device=device).float()
-    pts[..., 1] = torch.randint(0, 1500, (B, Nmax), device=device).float()
+    ch = torch.randint(0, 1050, (B, Nmax), device=device).float()
+    tk = torch.randint(0, 1125, (B, Nmax), device=device).float()
+    pts[..., 0] = (ch - 525.0) / 600.0
+    pts[..., 1] = (tk - 562.0) / 600.0
     pts[..., 3] = torch.rand(B, Nmax, device=device) * 2 - 1
     return pts, lengths
 
