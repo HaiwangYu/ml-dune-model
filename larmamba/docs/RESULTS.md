@@ -40,8 +40,11 @@ raised to match). Best macro-F1:
 | Tokens (num_init_groups) | sft_feat | voxel_svm_feat | training peak mem |
 |---|---|---|---|
 | 256 | **0.940** | 0.929 | ~40–45 GB |
-| 512 | 0.933 | 0.931 | ~45 GB |
-| 1024 | 0.936 | 0.923 | ~45 GB |
+| 512 | 0.935 | 0.931 | ~45 GB |
+| 1024 | 0.937 | 0.929 | ~45 GB |
+
+(All three ran the full 20k steps; values are best-over-training and cluster
+within ~0.005 — i.e. within probe-pool noise.)
 
 More tokens do **not** improve accuracy — 256 groups already capture the
 event structure for this DUNE APA wire-plane pixel-PID task. **Recommendation:
