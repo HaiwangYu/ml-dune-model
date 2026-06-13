@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>larmamba — linear-time foundation model for 2D LArTPC data</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+         max-width: 1000px; margin: 32px auto; padding: 0 24px; line-height: 1.55; color: #1a1a1a; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 6px; }
+  h2 { margin-top: 36px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+  h3 { margin-top: 22px; color: #444; }
+  code, pre { font-family: "SF Mono", Consolas, Menlo, monospace; }
+  code { background: #f2f2f2; padding: 1px 5px; border-radius: 3px; font-size: 0.95em; }
+  pre { background: #f7f7f7; padding: 10px 14px; border-radius: 6px; overflow-x: auto;
+        font-size: 0.86em; line-height: 1.4; border: 1px solid #e2e2e2; }
+  table { border-collapse: collapse; margin: 12px 0; }
+  th, td { border: 1px solid #bbb; padding: 6px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f0f0; }
+  .small { font-size: 0.9em; color: #555; }
+  .win { background: #e7f5e7; font-weight: bold; }
+  .caveat { background: #fff7e0; border: 1px solid #e0c66c; padding: 12px 16px; border-radius: 6px; margin: 16px 0; }
+  .path { color: #5c2d91; }
+  .arch { border-left: 4px solid #7a3fb0; padding-left: 16px; margin: 16px 0; }
+</style>
+</head>
+<body>
+
+<h1>larmamba: a linear-time (Mamba/SSM) foundation model for 2D LArTPC data</h1>
+<p class="small">DUNE APA wire-plane pixel data (channel × tick, sparse). Branch <code>may15</code>.
+Runs in <code>uvenv-polar-mae</code> (torch 2.5.1+cu124), imports PoLAr-MAE. Date 2026-06-13.</p>
+
+<h2>1. Goal &amp; idea</h2>
+<p>
+Earlier work established that on this DUNE pixel-PID task (3 classes: track / shower / other),
+<strong>PoLAr-MAE</strong> (FPS+ball-query tokenizer → ViT self-attention transformer → Chamfer
+reconstruction) reached ~0.93–0.94 feature-probe macro-F1, while sparse-CNN MAE/DINO models plateaued
+at ~0.65–0.72. The gap was <em>architectural</em> — tokenization + a global sequence mixer.
+</p>
+<p>
+PoLAr-MAE's global mixer is self-attention, which is <strong>O(T²)</strong> in token count T.
+<strong>larmamba</strong> asks: can we keep polarmae's accuracy but make the encoder
+<strong>O(T)</strong> by swapping self-attention for a <strong>bidirectional Mamba (selective
+state-space) mixer</strong>? Target: ≥0.90 macro-F1 at lower / better-scaling cost. Cost metric of
+interest: peak GPU memory (performance prioritised).
+</p>
+
+<h2>2. Architecture — what changed, what was reused</h2>
+<div class="arch">
+<p><strong>Reused from PoLAr-MAE verbatim</strong> (the parts that earned 0.93): the FPS+ball-query
+tokenizer, the APA2D dataset, the Chamfer+energy reconstruction loss, the LightningCLI training loop,
+and the 4-probe <code>APA2DProbeCallback</code> evaluation. larmamba runs in polarmae's env and imports
+it directly.</p>
+<p><strong>Replaced</strong>: only the encoder's sequence mixer. <code>larmamba.MambaEncoder</code> is a
+drop-in for <code>polarmae.layers.encoder.TransformerEncoder</code> — same
+<code>prepare_tokens</code> / <code>transformer</code> / <code>embed_dim</code> interface that the loss
+and probes rely on — but its transformer is a stack of <code>MambaBlock</code>s instead of attention
+<code>Block</code>s. The config simply points <code>model.encoder.class_path</code> at
+<code>larmamba.MambaEncoder</code>; the decoder stays attention (training-only, doesn't affect inference).</p>
+</div>
+
+<h3>2.1 The three larmamba-specific pieces</h3>
+<table>
+<tr><th>Piece</th><th>File</th><th>What / why</th></tr>
+<tr><td>Serialization</td><td><code>larmamba/serialize.py</code></td>
+<td>Mamba is a 1-D recurrence, but point tokens have no natural order. Tokens are ordered along a
+<strong>Morton/Z-order space-filling curve</strong> over their (channel,tick) centers so neighbours in
+the scan are spatial neighbours (PointMamba / Point-Cloud-Mamba recipe). Invalid/masked tokens sort to
+the tail.</td></tr>
+<tr><td>Bidirectional Mamba mixer</td><td><code>larmamba/mamba_block.py</code></td>
+<td><code>BiMambaMixer</code> + <code>MambaBlock</code>: in-proj → depthwise conv → selective SSM scanned
+<strong>both directions</strong> (Vim-style) → gate → out-proj, in a residual block reusing polarmae's
+<code>MaskedLayerNorm</code> / <code>MaskedDropPath</code> / <code>Mlp</code>. Masked tokens are made
+<em>transparent</em> (Δ=0 ⇒ state passes through untouched).</td></tr>
+<tr><td>Selective scan</td><td><code>larmamba/ssm.py</code></td>
+<td>The core <code>h_t = a_t h_{t-1} + b_t</code> recurrence. <strong>Two backends</strong>: (a) the
+official <code>mamba-ssm</code> CUDA kernel (fast, memory-optimal) on GPU; (b) a pure-PyTorch chunked +
+gradient-checkpointed parallel scan as CPU / fallback. Unit-tested: parallel vs sequential reference
+agree to ~1e-6 on both forward and gradient.</td></tr>
+</table>
+
+<h3>2.2 Engineering notes worth keeping</h3>
+<ul>
+<li><strong>Centers seam</strong>: <code>transformer(x, pos, mask)</code> carries no geometry, so
+<code>MambaEncoder.prepare_tokens</code> stashes the token <code>centers</code> on the transformer for
+the serialization step.</li>
+<li><strong>Kernel install</strong>: no PyPI/torch-2.10 wheels exist, but the training env is torch
+2.5.1+cu124, for which <code>mamba-ssm 2.2.5</code> + <code>causal-conv1d 1.5.0.post8</code> cu12 wheels
+do. Installed additively into <code>uvenv-polar-mae</code> (polarmae never imports them → baseline
+untouched); the package <code>__init__</code>'s <code>transformers</code> dependency is bypassed by
+importing the ops submodule directly.</li>
+<li><strong>dtype</strong>: under bf16-mixed autocast the kernel requires u/delta/B/C to share one dtype;
+they're unified to <code>u.dtype</code> in the wrapper.</li>
+<li><strong>Memory</strong>: the pure-torch scan first OOM'd in autograd (it stored O(log T) full
+(B,T,E,N) tensors). Rewritten to a chunked + checkpointed scan with persistent memory O(B·T·(E+N)).
+The kernel sidesteps this entirely.</li>
+</ul>
+
+<h2>3. Results — quality (four probes)</h2>
+<p>Best validation macro-F1 over training (pixel PID: track/shower/other). larmamba = 256-token run,
+20k steps, 1×L40S. Probes are identical to the polarmae/mae/dino comparison.</p>
+<table>
+<tr><th>Probe</th><th>larmamba (256)</th><th>PoLAr-MAE</th><th>MAE (sparse-CNN)</th><th>DINO (sparse-CNN)</th></tr>
+<tr><td><b>sft_feat</b> (MLP on features)</td><td class="win">0.940</td><td>0.933</td><td>0.674</td><td>0.719</td></tr>
+<tr><td><b>voxel_svm_feat</b> (linear SVM on features)</td><td>0.929</td><td class="win">0.940</td><td>0.651</td><td>0.656</td></tr>
+<tr><td>sft_raw (MLP on raw ch,tick,logQ)</td><td>0.545</td><td>0.526</td><td>0.462</td><td>0.473</td></tr>
+<tr><td>voxel_svm_raw (SVM on raw)</td><td>0.432</td><td>0.432</td><td>0.433</td><td>0.495</td></tr>
+</table>
+<p><strong>larmamba ≈ PoLAr-MAE</strong> — slightly ahead on the MLP probe, slightly behind on the linear
+SVM probe, ~0.25 absolute above the sparse-CNN backbones. Matching raw-probe baselines (svm_raw 0.432)
+confirm the comparison is fair (same task/taxonomy/splits).</p>
+
+<h2>4. Results — token-count sweep (256 saturates)</h2>
+<table>
+<tr><th>Tokens (num_init_groups)</th><th>sft_feat</th><th>voxel_svm_feat</th></tr>
+<tr><td>256</td><td class="win">0.940</td><td>0.929</td></tr>
+<tr><td>512</td><td>0.933</td><td>0.931</td></tr>
+<tr><td>1024</td><td>0.936</td><td>0.923</td></tr>
+</table>
+<p>More tokens do <strong>not</strong> improve accuracy — 256 groups already capture event structure for
+this task. <strong>Recommended operating point: 256 tokens.</strong></p>
+<div class="caveat">
+PoLAr-MAE's tokenizer uses coverage-based CNMS grouping, so on real sparse data the realized token count
+is bounded by <code>num_init_groups</code> <em>and</em> by event coverage; the sweep varies the cap, not a
+hard token count. Training peak memory (~40–45 GB for all three) is dominated by the attention
+<em>decoder</em> + the probe SVM extraction, not the Mamba encoder — so it does not separate token counts.
+The clean encoder cost is in §5.</div>
+
+<h2>5. Results — cost: Mamba O(T) vs attention O(T²)</h2>
+<p>Mixer-only benchmark (<code>larmamba/tests/bench_mixer.py</code>; B=8, dim=384, depth=12, bf16, L40S):
+synthetic token sequences of controlled length T fed straight to the sequence mixer, isolating it from the
+shared tokenizer.</p>
+<table>
+<tr><th>T</th><th>Mamba latency / mem</th><th>attention-flash latency / mem</th><th>attention-vanilla latency / mem</th></tr>
+<tr><td>256</td><td>7.1 ms / 0.22 GB</td><td>4.6 ms / 0.23 GB</td><td>3.5 ms / 0.19 GB</td></tr>
+<tr><td>512</td><td>10.3 / 0.27</td><td>14.4 / 0.43</td><td>7.6 / 0.32</td></tr>
+<tr><td>1024</td><td>20.5 / 0.36</td><td>63.4 / 1.18</td><td>34.7 / 0.79</td></tr>
+<tr><td>2048</td><td>43.5 / 0.56</td><td>232 / 4.07</td><td>122 / 2.63</td></tr>
+<tr><td>4096</td><td>104 / 0.96</td><td>931 / 15.4</td><td>514 / 9.9</td></tr>
+<tr><td>8192</td><td class="win">267 / 1.77</td><td>OOM</td><td>OOM</td></tr>
+</table>
+<ul>
+<li><strong>Latency</strong>: Mamba ~linear (32× tokens → ~38× time); attention ~quadratic (16× tokens →
+~200× time). Mamba is 3× faster at 1024, 9× at 4096.</li>
+<li><strong>Memory</strong>: Mamba linear (1.8 GB at 8192); attention OOMs at 8192. At 4096 Mamba uses
+~16× less memory.</li>
+<li><strong>At T=256 (the saturating point) they are comparable</strong> — attention is even slightly
+faster. Mamba's advantage is <em>scaling headroom</em>, not the current operating point.</li>
+</ul>
+<p class="small">End-to-end encoder benchmark (with the tokenizer): Mamba ~2.6× faster than attention at equal
+tokens; there, peak memory is dominated by the shared FPS/CNMS tokenizer (~20 GB), not the mixer.</p>
+
+<h2>6. Conclusions</h2>
+<ul>
+<li><strong>Quality goal met</strong>: larmamba is a PoLAr-MAE-quality 2D-LArTPC foundation model. Using a
+Mamba mixer instead of self-attention costs ~nothing in accuracy.</li>
+<li><strong>This task doesn't need the scaling</strong> (256 tokens saturate) — so the immediate payoff is
+"same accuracy, comparable cost at 256 tokens, with a much cheaper tail."</li>
+<li><strong>The linear encoder is decisive for regimes attention can't reach</strong>: finer tokenization,
+3D / multi-plane / full-APA inputs, or longer sequences (8192+ tokens at &lt;2 GB where attention OOMs).</li>
+<li><strong>CPU-portable</strong>: the unit-tested pure-PyTorch scan fallback runs without the CUDA kernel.</li>
+</ul>
+
+<h2>7. Reproduce</h2>
+<pre># train (1×L40S, ~2-3 h with the mamba-ssm kernel)
+bash gridutils/submit_larmamba.sh larmamba_full  larmamba/configs/larmamba_apa2d_full.yml
+bash gridutils/submit_larmamba.sh larmamba_g512  larmamba/configs/larmamba_apa2d_g512.yml
+bash gridutils/submit_larmamba.sh larmamba_g1024 larmamba/configs/larmamba_apa2d_g1024.yml
+
+# cost benchmarks (1×L40S, minutes)
+#   mixer scaling : gridutils/bench_larmamba.sh ... MIXER 8           -> larmamba.tests.bench_mixer
+#   encoder e2e   : gridutils/bench_larmamba.sh ... 256,512,1024,2048 16
+
+# correctness (CPU, no GPU needed)
+python -m larmamba.ssm                       # scan fwd+grad vs reference
+python -m larmamba.tests.smoke_local         # full pipeline integration</pre>
+<p class="small">Artifacts: <span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/larmamba_{full,g512,g1024,benchmixer}_260613/</span>.
+Full numeric writeup: <code>larmamba/docs/RESULTS.md</code>.</p>
+
+<h2>8. Open follow-ups</h2>
+<ol>
+<li><strong>Distill / shrink</strong> the encoder (fewer layers, smaller d_model) now that 256 tokens
+suffice — push inference cost lower at the current operating point.</li>
+<li><strong>Exploit scaling</strong>: finer tokenization or 3D/multi-plane inputs where attention can't fit
+— test whether larmamba <em>exceeds</em> polarmae.</li>
+<li>Replace the attention <strong>decoder</strong> with Mamba (training-only memory).</li>
+<li>Multi-GPU / longer pretraining (current: single-L40S, 20k steps).</li>
+</ol>
+
+</body>
+</html>
