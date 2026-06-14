@@ -79,7 +79,12 @@ def main():
     ap.add_argument("--n_events", type=int, default=32)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--kinds", default="mamba,attn")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the encoder transformer (mixer stack)")
     args = ap.parse_args()
+    if args.compile:
+        import torch._dynamo as _d
+        _d.config.suppress_errors = True   # fall back to eager on graph breaks
     device = args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
 
     ds = APA2D(data_path=args.data, apa=0, view="W", emin=1.0, emax=1.0e5,
@@ -106,6 +111,8 @@ def main():
 
     for kind in args.kinds.split(","):
         enc = build(kind, device)
+        if args.compile:
+            enc.transformer = torch.compile(enc.transformer, dynamic=True)
         for pts, lengths in events[:3]:
             with autocast():
                 run_one(enc, pts, lengths)

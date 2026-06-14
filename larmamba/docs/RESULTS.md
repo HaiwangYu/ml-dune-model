@@ -144,9 +144,17 @@ Memory = peak process RSS (`/proc/self/statm`).
 - So for **CPU deployment**: larmamba's edge over mae/dino is that it *runs at
   all* (at polarmae accuracy); it is **not** faster/lighter than polarmae on CPU
   here. larmamba's linear-time advantage would only surface at token counts far
-  above this task's ~160. To actually win CPU latency, the next lever is op
-  fusion — `torch.compile` of the encoder, or a compiled (numba/Triton-CPU)
-  scan — not the seq-vs-chunked choice.
+  above this task's ~160.
+- **`torch.compile` was tried and does NOT help on CPU** — it times out (>700 s)
+  during *compilation*, both with `dynamic=True` (per-event variable token count
+  → recompile thrash) and on a single static shape. The selective scan's python
+  loops + many small ops are hostile to inductor; the cost is in codegen, not
+  runtime. So op-fusion via `torch.compile` is not a quick lever. A real CPU
+  speedup needs a hand-written fixed-shape / loop-free fused scan (or a
+  numba/Triton-CPU kernel) — a genuine implementation effort. The per-event CPU
+  cost is dominated by fixed scan overhead (d_inner=768 × d_state=16 across 24
+  selective-scans × 12 layers), not token count — a 50-token event still took
+  3.4 s eager.
 
 ## 4. Interpretation / where this matters
 

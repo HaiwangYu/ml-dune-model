@@ -191,8 +191,13 @@ CPU default (chunked/CUDA kernel remain for training/GPU).</p>
 CPU</strong> (pure-torch scan fallback) at polarmae accuracy, but at this token scale (~160) it is still ~8×
 <em>slower</em> than polarmae's attention. The seq-vs-chunked choice is minor; the real bottleneck is the
 <em>unfused pure-torch Mamba</em> (24 selective-scans × 12 layers of small ops) vs BLAS-bound attention.
-So for CPU deployment larmamba's edge over mae/dino is that it <em>runs at all</em>; the lever to actually
-win CPU latency is op fusion (<code>torch.compile</code> / a compiled scan), not the scan backend.</div>
+So for CPU deployment larmamba's edge over mae/dino is that it <em>runs at all</em>; the scan backend is
+not the lever. <strong><code>torch.compile</code> was tried and does NOT help</strong> — it times out
+(&gt;700 s) during compilation (dynamic: per-event variable token count → recompile thrash; static: still
+times out), because the scan's python loops + many small ops are hostile to inductor. A real CPU speedup
+needs a hand-written fixed-shape / loop-free fused scan (or numba/Triton-CPU kernel). Per-event CPU cost is
+dominated by fixed scan overhead (d_inner=768 × d_state=16 across 24 scans × 12 layers), not token count
+(a 50-token event still took 3.4 s eager).</div>
 
 <h2>6. Conclusions</h2>
 <ul>
