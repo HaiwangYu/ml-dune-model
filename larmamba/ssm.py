@@ -23,10 +23,17 @@ Run the self-test:
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+# CPU scan backend (no CUDA kernel available there): "seq" = sequential
+# recurrence (low overhead at small T, the typical inference regime); "chunked"
+# = the parallel Hillis-Steele scan (log(L) passes over big tensors, better for
+# large T / training). Overridable via env for benchmarking.
+CPU_SCAN_BACKEND = os.environ.get("LARMAMBA_CPU_SCAN", "seq")
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +181,10 @@ def selective_scan(
         fn = kernel_selective_scan_fn()
         if fn is not None:
             return _selective_scan_kernel(fn, u, delta, A, B, C, D)
+    elif CPU_SCAN_BACKEND == "seq":
+        # On CPU the sequential recurrence has far less overhead than the
+        # log(L) parallel-scan passes at the small T of inference.
+        return selective_scan_seq(u, delta, A, B, C, D)
 
     Bb, T, E = u.shape
     dtype_in = u.dtype
@@ -216,6 +227,11 @@ def selective_scan_ref(
         ys.append(y_t)
     y = torch.stack(ys, dim=1) + u32 * D.float().view(1, 1, E)
     return y.to(u.dtype)
+
+
+# Production CPU sequential backend == the sequential reference (validated
+# equal to the parallel scan in the unit test, fwd + grad).
+selective_scan_seq = selective_scan_ref
 
 
 # ---------------------------------------------------------------------------

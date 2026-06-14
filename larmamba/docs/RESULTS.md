@@ -127,20 +127,26 @@ Memory = peak process RSS (`/proc/self/statm`).
 |---|---|---|---|
 | mae / dino (sparse-CNN) | **NO — GPU-only** | — | — |
 | polarmae (attention) | yes | **516** | 791 |
-| larmamba (Mamba, pure-torch scan) | yes | 4537 | 872 |
+| larmamba (Mamba, seq scan) | yes | 3955 | 822 |
+| larmamba (Mamba, chunked scan) | yes | 4441 | 879 |
 
 - **mae/dino cannot run on CPU at all**: WarpConvNet's sparse hashmap asserts
   `coords must be on CUDA`. The lightest GPU model has *no* CPU path.
-- **larmamba runs on CPU** (via the pure-torch scan fallback) — but at this
-  token scale (~160) it is **~9× slower than polarmae's attention** and
-  slightly heavier. The pure-torch selective scan (python chunk loop +
-  Hillis-Steele passes) is the bottleneck; attention on CPU is BLAS-bound and
-  fast at small T.
-- So for **CPU deployment**: larmamba's edge over mae/dino is simply that it
-  *runs* (and at polarmae accuracy); it is **not** faster/lighter than polarmae
-  on CPU here. larmamba's linear-time advantage would only surface on CPU at
-  token counts far larger than this task's. A sequential-scan CPU path (or a
-  numba/Triton-CPU kernel) is the obvious optimization if CPU latency matters.
+- **CPU scan backend** (`larmamba.ssm.CPU_SCAN_BACKEND`, env `LARMAMBA_CPU_SCAN`):
+  the **sequential recurrence ("seq") is ~11% faster and lighter** than the
+  parallel Hillis-Steele "chunked" scan at this token scale, so it is the CPU
+  default. (The chunked/parallel scan and the CUDA kernel remain for
+  training / GPU.)
+- **But larmamba on CPU is still ~8× slower than polarmae's attention** (3955 vs
+  516 ms). The scan-backend choice is a minor factor — the real bottleneck is
+  the *unfused pure-torch Mamba* (24 selective-scans × 12 layers of small ops),
+  whereas attention on CPU is BLAS-bound and fast at small T.
+- So for **CPU deployment**: larmamba's edge over mae/dino is that it *runs at
+  all* (at polarmae accuracy); it is **not** faster/lighter than polarmae on CPU
+  here. larmamba's linear-time advantage would only surface at token counts far
+  above this task's ~160. To actually win CPU latency, the next lever is op
+  fusion — `torch.compile` of the encoder, or a compiled (numba/Triton-CPU)
+  scan — not the seq-vs-chunked choice.
 
 ## 4. Interpretation / where this matters
 

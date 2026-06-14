@@ -179,16 +179,20 @@ is <strong>accuracy</strong> (polarmae-level, +0.25 over sparse-CNN); its win ov
 <tr><th>Model</th><th>runs on CPU?</th><th>latency (ms/event)</th><th>peak RSS (MiB)</th></tr>
 <tr><td>mae / dino (sparse-CNN)</td><td><b>NO — GPU-only</b></td><td>—</td><td>—</td></tr>
 <tr><td>polarmae (attention)</td><td>yes</td><td class="win">516</td><td>791</td></tr>
-<tr><td>larmamba (Mamba, pure-torch scan)</td><td>yes</td><td>4537</td><td>872</td></tr>
+<tr><td>larmamba (Mamba, seq scan)</td><td>yes</td><td>3955</td><td>822</td></tr>
+<tr><td>larmamba (Mamba, chunked scan)</td><td>yes</td><td>4441</td><td>879</td></tr>
 </table>
+<p>CPU scan backend (<code>LARMAMBA_CPU_SCAN</code>): the <strong>sequential recurrence ("seq") is ~11%
+faster + lighter</strong> than the parallel Hillis-Steele ("chunked") scan at this token scale, and is the
+CPU default (chunked/CUDA kernel remain for training/GPU).</p>
 <div class="caveat">
 <strong>mae/dino cannot run on CPU at all</strong> — WarpConvNet's sparse hashmap asserts
-<code>coords must be on CUDA</code>; the lightest GPU model has no CPU path. <strong>larmamba does run on
-CPU</strong> (pure-torch scan fallback) at polarmae accuracy, but at this token scale (~160) it is ~9×
-<em>slower</em> than polarmae's attention (the pure-torch selective scan is the bottleneck; attention is
-BLAS-bound and fast at small T). So for CPU deployment, larmamba's edge over mae/dino is that it
-<em>runs</em>; it is not faster/lighter than polarmae here. A sequential-scan or numba/Triton-CPU kernel
-is the obvious fix if CPU latency matters.</div>
+<code>coords must be on CUDA</code>; the lightest GPU model has no CPU path. <strong>larmamba runs on
+CPU</strong> (pure-torch scan fallback) at polarmae accuracy, but at this token scale (~160) it is still ~8×
+<em>slower</em> than polarmae's attention. The seq-vs-chunked choice is minor; the real bottleneck is the
+<em>unfused pure-torch Mamba</em> (24 selective-scans × 12 layers of small ops) vs BLAS-bound attention.
+So for CPU deployment larmamba's edge over mae/dino is that it <em>runs at all</em>; the lever to actually
+win CPU latency is op fusion (<code>torch.compile</code> / a compiled scan), not the scan backend.</div>
 
 <h2>6. Conclusions</h2>
 <ul>
