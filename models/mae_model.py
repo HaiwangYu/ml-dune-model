@@ -336,15 +336,21 @@ class SparseMAEModel(nn.Module):
         flash_attention:  bool = True,
         encoding_dim:     int  = 32,
         encoding_range:   float = 300.0,
+        backbone:         nn.Module = None,
     ):
         super().__init__()
 
-        self.backbone = MinkUNetSparseAttentionCore(
-            spatial_encoding=spatial_encoding,
-            flash_attention=flash_attention,
-            encoding_dim=encoding_dim,
-            encoding_range=encoding_range,
-        )
+        # backbone is configurable (sparseformer experiments); default = the
+        # original MinkUNet core.  Any Voxels[1ch] -> Voxels[64ch] module works.
+        if backbone is not None:
+            self.backbone = backbone
+        else:
+            self.backbone = MinkUNetSparseAttentionCore(
+                spatial_encoding=spatial_encoding,
+                flash_attention=flash_attention,
+                encoding_dim=encoding_dim,
+                encoding_range=encoding_range,
+            )
 
         # SSL head: 64 → 1 feature channel (charge reconstruction)
         self.charge_head = SparseConv2d(64, 1, kernel_size=1, bias=True)

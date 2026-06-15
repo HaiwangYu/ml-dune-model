@@ -885,6 +885,8 @@ def main(
     resume                     = None,   # path to checkpoint to resume from
     run_name                   = "",     # optional label; nests outputs under run_name/ if set
     cache_dir                  = "./data",  # dataset index .pt cache directory (persist across jobs)
+    backbone_name              = "",     # "" → legacy default; else sparseformer.build_backbone name
+    backbone_kwargs            = None,   # extra kwargs for build_backbone (e.g. n_bottleneck_blocks)
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
     # If a run name is given, nest outputs under <base>/<run_name>/
@@ -1021,7 +1023,14 @@ def main(
         model = SparseTrueMAEModel(n_classes=n_classes).to(device)
         print("Using true MAE (coordinate-removal masking)")
     else:
-        model = SparseMAEModel(n_classes=n_classes).to(device)
+        backbone = None
+        if backbone_name:
+            from sparseformer.backbones import build_backbone
+            backbone = build_backbone(backbone_name, **(backbone_kwargs or {}))
+            print(f"Backbone: {backbone_name}  kwargs={backbone_kwargs or {}}")
+        else:
+            print("Backbone: minkunet (legacy default)")
+        model = SparseMAEModel(n_classes=n_classes, backbone=backbone).to(device)
 
     # ── Optimizers ────────────────────────────────────────────────────────
     ssl_params = list(model.backbone.parameters()) + list(model.charge_head.parameters())
