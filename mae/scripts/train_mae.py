@@ -1020,7 +1020,12 @@ def main(
 
     # ── Model ─────────────────────────────────────────────────────────────
     if true_mae:
-        model = SparseTrueMAEModel(n_classes=n_classes).to(device)
+        tm_backbone = None
+        if backbone_name:
+            from sparseformer.backbones import build_backbone
+            tm_backbone = build_backbone(backbone_name, **(backbone_kwargs or {}))
+            print(f"Backbone (true-MAE): {backbone_name}  kwargs={backbone_kwargs or {}}")
+        model = SparseTrueMAEModel(n_classes=n_classes, backbone=tm_backbone).to(device)
         print("Using true MAE (coordinate-removal masking)")
     else:
         backbone = None

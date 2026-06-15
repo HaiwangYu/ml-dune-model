@@ -462,14 +462,19 @@ class SparseTrueMAEModel(nn.Module):
         flash_attention:  bool  = True,
         encoding_dim:     int   = 32,
         encoding_range:   float = 300.0,
+        backbone:         nn.Module = None,
     ):
         super().__init__()
-        self.backbone = MinkUNetTrueMAECore(
-            spatial_encoding=spatial_encoding,
-            flash_attention=flash_attention,
-            encoding_dim=encoding_dim,
-            encoding_range=encoding_range,
-        )
+        # configurable true-MAE backbone (dual-input); default = original core.
+        if backbone is not None:
+            self.backbone = backbone
+        else:
+            self.backbone = MinkUNetTrueMAECore(
+                spatial_encoding=spatial_encoding,
+                flash_attention=flash_attention,
+                encoding_dim=encoding_dim,
+                encoding_range=encoding_range,
+            )
         self.charge_head        = SparseConv2d(64, 1, kernel_size=1, bias=True)
         self.coord_head         = SparseConv2d(64, 2, kernel_size=1, bias=True)
         self.pixel_pid_head     = SparsePixelHead(in_ch=64, n_classes=n_classes)
