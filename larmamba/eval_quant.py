@@ -91,7 +91,9 @@ def n_classes_and_run(model, cap, device, sft_epochs=30, sft_batch=256, sft_lr=5
 
     torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
-    feat_pool, raw_pool = cb._collect_pool(model, dm)   # the GPU-heavy encoder forwards
+    # autocast ONLY the encoder feature extraction; probe fitting stays fp32
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        feat_pool, raw_pool = cb._collect_pool(model, dm)
     torch.cuda.synchronize()
     extract_s = time.time() - t0
     peak_mib = torch.cuda.max_memory_allocated() / 2**20
@@ -128,8 +130,7 @@ def main():
     enc, _ = apply_quant(enc, args.quant)
     model = _Shim(enc, torch.device(device)).to(device).eval()
 
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        probes, peak_mib, extract_s = n_classes_and_run(model, 5000, device)
+    probes, peak_mib, extract_s = n_classes_and_run(model, 5000, device)
 
     res = dict(ckpt=os.path.basename(args.ckpt), num_groups=args.num_groups,
                quant=args.quant, peak_MiB=round(peak_mib, 1), extract_s=round(extract_s, 1),
