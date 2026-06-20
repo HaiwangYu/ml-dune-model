@@ -71,15 +71,53 @@ larmamba already matches PoLAr-MAE accuracy (~0.93). On memory:
   one: the mixer benchmark (RESULTS.md §5) shows Mamba at 8192 tokens uses 1.8 GB
   while attention OOMs. Quantization is an additive ~10% on top.
 
+## Quantized head-to-head vs PoLAr-MAE (256 tokens, batch 8)
+
+Ran PoLAr-MAE's trained attention encoder through the *same* int8/fp8 harness
+(`eval_quant.py --encoder polarmae`). Weight-only quant dequantizes to bf16
+before the matmul, so flash-attention is unaffected (no failure).
+
+| Model | precision | voxel_svm_feat | sft_feat | peak MiB | quant Δmem | extract s |
+|---|---|---|---|---|---|---|
+| PoLAr-MAE | bf16 | **0.939** | 0.931 | 1199 | — | 3.2 |
+| PoLAr-MAE | int8 | 0.938 | 0.932 | **1094** | −8.8% | 2.2 |
+| PoLAr-MAE | fp8  | 0.938 | 0.927 | **1094** | −8.8% | 2.2 |
+| larmamba | bf16 | 0.928 | 0.928 | 1236 | — | 7.1 |
+| larmamba | int8 | 0.929 | 0.936 | 1099 | −11.1% | 7.1 |
+| larmamba | fp8  | 0.929 | 0.931 | 1098 | −11.1% | 6.8 |
+
+**At this 256-token operating point, the two are essentially tied on memory**
+(quantized ~1094 vs ~1099 MiB) — and PoLAr-MAE is marginally *ahead*: lower bf16
+memory (1199 vs 1236), slightly higher `voxel_svm_feat` (0.938 vs 0.929), and
+~3× faster extraction (2–3 s vs 7 s; the Mamba scan carries fixed per-call
+overhead that attention avoids at small token counts). **Quantization helps both
+models ~9–11%** and does not change the ranking.
+
+This is consistent with everything measured: at the task's saturating token
+count both encoders are tokenizer-dominated and roughly equal, so neither
+quantization nor the Mamba mixer makes larmamba cheaper than PoLAr-MAE *here*.
+larmamba's only genuine memory/scaling advantage is the **high-token regime**
+(mixer bench, RESULTS.md §5): at 8192 tokens Mamba uses 1.8 GB while attention
+OOMs — but this task doesn't need that many tokens.
+
 ## Verdict
 
-Post-training int8/fp8 weight-only quantization gives larmamba a **free ~10%
-inference-memory reduction at iso-accuracy (~0.93)**, with fp8 usable on the L40S.
-It does **not** raise accuracy (the task saturates at 256 tokens), so the win is
-purely efficiency. The cheapest correct operating point is **int8 (or fp8) @ 256
-tokens, ~1.1 GB at batch 8, ~0.93 macro-F1**. Quantization stacks with — but is
-secondary to — larmamba's core advantage over attention (linear-time scaling to
-large token counts).
+Post-training int8/fp8 weight-only quantization gives a **free ~9–11%
+inference-memory reduction at iso-accuracy (~0.93)** for *both* larmamba and
+PoLAr-MAE, with fp8 usable on the L40S. It does **not** raise accuracy (the task
+saturates at 256 tokens), so the win is purely efficiency.
+
+**Head-to-head answer (the user's question):** at the 256-token operating point
+this task needs, **quantized larmamba does not use less memory than quantized
+PoLAr-MAE — they are tied (~1094–1099 MiB), and PoLAr-MAE is marginally ahead**
+on bf16 memory, accuracy (svm_feat 0.938 vs 0.929), and speed. Both are
+tokenizer-dominated here, so quantization helps both equally and the Mamba mixer
+buys nothing at this scale. larmamba's genuine advantage over attention is
+**only** the high-token regime (8192 tokens: Mamba 1.8 GB vs attention OOM) — a
+regime this task does not require. Net: for *this* DUNE pixel-PID task, larmamba
+and PoLAr-MAE are equivalent in accuracy and (quantized) memory; choose PoLAr-MAE
+for slightly better accuracy/speed at 256 tokens, or larmamba if you need to
+scale tokens far beyond what attention can fit.
 
 ## Reproduce
 
