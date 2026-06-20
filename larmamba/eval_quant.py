@@ -23,6 +23,7 @@ from polarmae.eval.probes import (
     _fit_svm, _train_head, _head_predict, _confusion, _eff_purity, _macro_f1,
 )
 from larmamba import MambaEncoder
+from polarmae.layers.encoder import TransformerEncoder
 
 CENTER = torch.tensor([525.0, 562.0, 0.0])
 SCALE = 1.0 / 600.0
@@ -46,12 +47,24 @@ class _Shim(nn.Module):
         return p
 
 
-def build_encoder(num_groups, context_length, device):
+def build_encoder(encoder_type, num_groups, context_length, device):
     tk = {"group_radius": 5 / 600, "num_init_groups": num_groups, "context_length": context_length}
-    enc = MambaEncoder(num_channels=4, arch="vit_small", voxel_size=5,
-                       tokenizer_kwargs=tk,
-                       transformer_kwargs={"add_pos_at_every_layer": True},
-                       mamba_kwargs={"d_state": 16, "d_conv": 4, "expand": 2})
+    if encoder_type == "mamba":
+        enc = MambaEncoder(num_channels=4, arch="vit_small", voxel_size=5,
+                           tokenizer_kwargs=tk,
+                           transformer_kwargs={"add_pos_at_every_layer": True},
+                           mamba_kwargs={"d_state": 16, "d_conv": 4, "expand": 2})
+    elif encoder_type == "polarmae":
+        # matches polarmae_apa2d_full hparams (attention ViT-S encoder)
+        enc = TransformerEncoder(num_channels=4, arch="vit_small", voxel_size=5,
+                                 masking_ratio=0.6, masking_type="rand",
+                                 tokenizer_kwargs=tk,
+                                 transformer_kwargs={"postnorm": False, "add_pos_at_every_layer": True,
+                                                     "drop_rate": 0.0, "attn_drop_rate": 0.05,
+                                                     "drop_path_rate": 0.25, "use_flash_self_attn": True},
+                                 apply_relative_position_bias=False)
+    else:
+        raise ValueError(encoder_type)
     return enc.to(device).eval()
 
 
@@ -117,22 +130,23 @@ def n_classes_and_run(model, cap, device, sft_epochs=30, sft_batch=256, sft_lr=5
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--encoder", default="mamba", choices=["mamba", "polarmae"])
     ap.add_argument("--num_groups", type=int, default=256)
     ap.add_argument("--context_length", type=int, default=512)
     ap.add_argument("--quant", default="none", choices=["none", "int8", "fp8"])
     args = ap.parse_args()
     device = "cuda"
 
-    print(f"=== larmamba quant-eval  ckpt={os.path.basename(args.ckpt)}  "
+    print(f"=== quant-eval  encoder={args.encoder}  ckpt={os.path.basename(args.ckpt)}  "
           f"num_groups={args.num_groups}  quant={args.quant} ===")
-    enc = build_encoder(args.num_groups, args.context_length, device)
+    enc = build_encoder(args.encoder, args.num_groups, args.context_length, device)
     enc = load_encoder_weights(enc, args.ckpt)
     enc, _ = apply_quant(enc, args.quant)
     model = _Shim(enc, torch.device(device)).to(device).eval()
 
     probes, peak_mib, extract_s = n_classes_and_run(model, 5000, device)
 
-    res = dict(ckpt=os.path.basename(args.ckpt), num_groups=args.num_groups,
+    res = dict(encoder=args.encoder, ckpt=os.path.basename(args.ckpt), num_groups=args.num_groups,
                quant=args.quant, peak_MiB=round(peak_mib, 1), extract_s=round(extract_s, 1),
                **{k: round(v, 4) for k, v in probes.items()})
     print("RESULT " + json.dumps(res))
