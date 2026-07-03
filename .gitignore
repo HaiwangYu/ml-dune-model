@@ -13,3 +13,8 @@ run_*
 *.json
 .claude
 debug
+*.sh
+*.png
+*.npz
+saved-claude-plans
+cheatsheet.md
