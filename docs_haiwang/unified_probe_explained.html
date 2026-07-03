@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>The unified PID probe — and what each model's old probe did</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+           max-width: 980px; margin: 32px auto; padding: 0 24px; line-height: 1.55;
+           color: #1a1a1a; }
+    h1 { border-bottom: 2px solid #333; padding-bottom: 6px; }
+    h2 { margin-top: 36px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+    h3 { margin-top: 22px; color: #444; }
+    code, pre { font-family: "SF Mono", Consolas, Menlo, monospace; }
+    code { background: #f2f2f2; padding: 1px 5px; border-radius: 3px; font-size: 0.95em; }
+    pre { background: #f7f7f7; padding: 10px 14px; border-radius: 6px; overflow-x: auto;
+          font-size: 0.88em; line-height: 1.4; border: 1px solid #e2e2e2; }
+    table { border-collapse: collapse; margin: 12px 0; width: 100%; }
+    th, td { border: 1px solid #bbb; padding: 6px 12px; text-align: left; vertical-align: top; }
+    th { background: #f0f0f0; }
+    .arch { border-left: 4px solid; padding-left: 16px; margin: 16px 0; }
+    .mae      { border-color: #2b7cbf; }
+    .dino     { border-color: #e08c2a; }
+    .sf       { border-color: #8a5fbf; }
+    .polarmae { border-color: #57a356; }
+    .small { font-size: 0.9em; color: #555; }
+    .caveat { background: #fff7e0; border: 1px solid #e0c66c; padding: 12px 16px;
+              border-radius: 6px; margin: 16px 0; }
+    .leak { background: #fdecec; border: 1px solid #d9908f; padding: 12px 16px;
+            border-radius: 6px; margin: 16px 0; }
+    .ok   { color: #2e7d32; font-weight: 600; }
+    .bad  { color: #b23b38; font-weight: 600; }
+    .num  { font-variant-numeric: tabular-nums; }
+    .path { color: #5c2d91; }
+  </style>
+</head>
+<body>
+
+<h1>The unified PID probe — and what each model's old probe did</h1>
+
+<p class="small">
+  Companion to <code>dino/docs/unified_pid_probe.md</code> (usage) and
+  <code>dino/docs/unified_probe_results.md</code> (results, 2026-07-02).
+  This page explains <em>why</em> the re-evaluation was needed: what the new
+  probe does, what each model's <em>old</em> probe did differently, and which
+  of those differences turned out to matter.
+</p>
+
+<h2>1. The task, common to everything</h2>
+
+<p>
+  Per-pixel PID on DUNE wire-plane sparse data: every reco voxel
+  (channel,&nbsp;tick,&nbsp;charge) gets a 3-class label
+  {<b>track</b>, <b>shower</b>, <b>other</b>} derived from the per-pixel PDG
+  truth by <code>pdg_to_pixel_class()</code> (μ/p/π → track; e<sup>±</sup> and
+  large-γ EM clusters → shower; γ blips and the rest → other; no-truth pixels
+  dropped). A <em>probe</em> freezes the SSL backbone, extracts a feature per
+  voxel, fits a small head on the features, and reports held-out
+  <b>macro-F1</b>. The probe measures the representation — the backbone never
+  sees the labels.
+</p>
+
+<p>Every probe (old and new) reports the same four numbers:</p>
+
+<table>
+  <tr><th>key</th><th>features</th><th>head</th><th>reads as</th></tr>
+  <tr><td><code>voxel_svm_feat</code></td><td>backbone features</td><td>LinearSVC</td>
+      <td rowspan="2">the representation's linear / near-linear signal</td></tr>
+  <tr><td><code>sft_feat</code></td><td>backbone features</td><td>small MLP</td></tr>
+  <tr><td><code>voxel_svm_raw</code></td><td>(channel, tick, log&nbsp;q)</td><td>LinearSVC</td>
+      <td rowspan="2">the no-backbone floor; the lift of <code>_feat</code> over
+      <code>_raw</code> is the backbone's real contribution</td></tr>
+  <tr><td><code>sft_raw</code></td><td>(channel, tick, log&nbsp;q)</td><td>small MLP</td></tr>
+</table>
+
+<h2>2. What the unified probe is</h2>
+
+<p>
+  <code>dino/diagnostics/ab_pid_probe.py</code> (ported from WC_FM_DINO; see
+  that repo's <code>docs/28_polarmae_intrinsic_eval_leakage.md</code>). Two
+  properties define it:
+</p>
+
+<h3>2.1 Leakage-free <em>event-level</em> split</h3>
+
+<p>
+  Whole events are split 80/20 <em>first</em>; per-pixel examples are pooled
+  afterwards, within each side:
+</p>
+
+<pre>uniq_events = np.unique(keys, axis=0)        # keys = (file_idx, event_idx) per pixel
+perm        = rng.permutation(len(uniq_events))
+train_set   = set(map(tuple, uniq_events[perm[:int(0.8 * len(uniq_events))]]))
+is_train    = np.array([tuple(k) in train_set for k in keys])</pre>
+
+<p>
+  No event's pixels can appear on both sides. The alternative — pooling voxels
+  across events and permuting the pooled array — lets the head partially
+  memorize each event's geometry, topology and local charge pattern through
+  spatially-smooth features, and inflates macro-F1 by ~15 points. That
+  inflation is a property of the <em>protocol</em>, not of the representation.
+</p>
+
+<h3>2.2 One code path for every model</h3>
+
+<p>
+  A native DINO checkpoint (<code>--ckpts</code>, live forward pass) and any
+  foreign model's precomputed per-voxel feature export
+  (<code>--external</code>, a CSR <code>.npz</code> of
+  <code>coords / feat / offsets</code>) flow through the <em>same</em>
+  functions: coordinate matching (<code>_match_align_label</code>) → PDG
+  labeling → raw floor → event-level split → <code>StandardScaler</code> →
+  LinearSVC / MLP. Only the source of <code>(feature, coord)</code> pairs
+  differs per run, so cross-architecture numbers are comparable by
+  construction.
+</p>
+
+<p>Two built-in sanity mechanisms:</p>
+<ul>
+  <li><b>Alignment gate</b> — model-output rows are joined to truth rows by
+      (channel,&nbsp;tick) per event, and the run <em>aborts</em> if the match
+      rate falls below 0.95 (default). All seven 260702 runs matched at
+      1.0000.</li>
+  <li><b>Identical raw floors</b> — because every run scores the same events
+      under the same split, <code>voxel_svm_raw</code>/<code>sft_raw</code>
+      must come out identical across rows (0.402 / 0.485). In the old table
+      the floors scattered 0.43–0.53 across pipelines, a visible symptom of
+      protocol heterogeneity.</li>
+</ul>
+
+<h3>2.3 How each model gets in</h3>
+
+<table>
+  <tr><th>model</th><th>path into the probe</th></tr>
+  <tr><td>dino</td><td>native <code>--ckpts</code> (live backbone, teacher or student view)</td></tr>
+  <tr><td>mae</td><td><code>mae/diagnostics/export_pid_features.py</code> → npz
+      (frozen backbone, log1p norm)</td></tr>
+  <tr><td>sparseformer</td><td>same exporter with <code>--config</code>, which rebuilds the
+      backbone from the run config's <code>backbone_name/backbone_kwargs</code></td></tr>
+  <tr><td>polarmae / larmamba</td><td><code>dino/diagnostics/export_probe_events.py</code> dumps the
+      probe's event list (coords + raw ADC) as a bridge into the torch-2.5 env;
+      <code>larmamba/export_pid_features.py</code> replicates the APA2D input
+      construction exactly (charge&nbsp;&gt;&nbsp;1 threshold, 8000-pt cap,
+      log-transform, center+scale), encodes, and K-NN-upsamples token features
+      (K=5, inverse-distance — the same scheme polarmae's own probe uses) at
+      <em>all</em> dumped voxels → match rate 1.0 by construction</td></tr>
+</table>
+
+<h2>3. The old probes, model by model</h2>
+
+<div class="arch mae">
+<h3>mae — training-time offline-pool probe <span class="ok">(event-level, no leak)</span></h3>
+<p>
+  The v3 headline numbers came from <code>mae/scripts/train_mae.py</code>'s
+  per-epoch probe: the SFT dataset is split into disjoint <em>event</em>
+  subsets up front (<code>Subset</code> over dataset indices), then
+  <code>_collect_sft_pool</code> drains each side separately into
+  5000/class voxel pools; SVM + a 3-layer BN MLP (<code>DensePixelHead</code>)
+  are fit on the train pool and scored on the val pool. 64-d features, log1p
+  charge norm. <b>Clean split</b> — mae's number moved <em>up</em> slightly
+  (0.674 → 0.725 sft) under the unified probe, for benign protocol reasons
+  (different head, different events, per-run scaler).
+</p>
+</div>
+
+<div class="arch sf">
+<h3>sparseformer — same mae probe <span class="ok">(event-level, no leak)</span></h3>
+<p>
+  All sparseformer numbers (R1 shapes, R2 capacity sweep) came from the same
+  training-time offline-pool probe, so they were also leakage-free. What did
+  <em>not</em> survive the unified re-run is the <b>capacity conclusion</b>:
+  the old protocol showed w256 (19.5M) at 0.769 vs combo (1.27M) at 0.722 —
+  a +0.047 "width win". The unified probe scores them 0.734 vs 0.749
+  (sft) and 0.700 vs 0.698 (svm): a tie, with combo ahead on the MLP probe.
+  The width win was the same size as ordinary cross-protocol variance, and it
+  vanished. Lesson: differences of ~0.03–0.05 between <em>separately-run</em>
+  probes are not conclusions; only within-one-probe comparisons are.
+</p>
+</div>
+
+<div class="arch dino">
+<h3>dino — <code>run_probes.py</code> <span class="ok">(image-level, no leak)</span></h3>
+<p>
+  <code>dino/diagnostics/run_probes.py</code> (built for the 260528 dino
+  evaluation) splits at the image level before pooling, applies the DINO
+  <code>FeatureLogTransform</code> norm, and fits the same SVM + BN-MLP pair
+  on 5000/class pools. Clean split; teacher and student probed separately.
+  Under the unified probe dino moved up ~0.05 (0.719 → 0.768 sft; 0.655 →
+  0.713 svm), same benign reasons as mae. The unified probe's
+  <code>--ckpts</code> path is essentially this probe's extraction plus the
+  shared fitting code — <code>ab_pid_probe</code> adds the external-model path
+  and the explicit coordinate gate.
+</p>
+</div>
+
+<div class="arch polarmae">
+<h3>polarmae &amp; larmamba — <code>APA2DProbeCallback</code> <span class="bad">(pixel-level split → leak)</span></h3>
+<p>
+  Both token models used PoLAr-MAE's probe callback
+  (<code>polarmae/eval/probes.py</code>), at training time and in every
+  offline eval (<code>larmamba/eval_quant.py</code> included). Its pipeline:
+  drain the probe loader, K-NN-upsample token features to voxels
+  (<code>_extract_per_voxel_features</code>), pool per-class capped samples
+  <em>across events</em> — and then split:
+</p>
+<pre>def _split(self, vb, rng):                  # polarmae/eval/probes.py:464
+    perm = rng.permutation(n)               # n = pooled PIXELS, all events mixed
+    cut  = int(self.train_frac * n)
+    return vb[perm[:cut]], vb[perm[cut:]]   # same event on both sides</pre>
+<p>
+  That is a <b>pixel-level split</b>: ~80% of every event's pooled pixels land
+  in train and ~20% in val. It interacts badly with exactly this feature type:
+  each voxel's feature is an inverse-distance blend of its ≤5 nearest token
+  vectors, so all voxels in a neighbourhood share nearly the same feature. A
+  head that memorizes "this token-blend ⇒ track" from an event's train pixels
+  scores its val pixels for free.
+</p>
+</div>
+
+<div class="leak">
+  <b>Measured size of the leak:</b> polarmae 0.933/0.940 → 0.783/0.800 and
+  larmamba 0.940/0.929 → 0.782/0.805 (sft/svm) — <b>−0.13 to −0.15</b>,
+  right in the ~15-point band WC_FM_DINO docs/28 measured for spatially-smooth
+  features under pixel-level splits. The sparse-CNN models, whose old probes
+  split by event/image, did not fall.
+</div>
+
+<h2>4. Old vs unified, side by side</h2>
+
+<table>
+  <tr>
+    <th>model</th><th>old probe</th><th>old split</th>
+    <th class="num">old sft / svm</th><th class="num">unified sft / svm</th><th>Δ</th>
+  </tr>
+  <tr><td>mae (ep1, 0.48M)</td><td>train_mae offline pool</td><td class="ok">event</td>
+      <td class="num">0.674 / 0.651</td><td class="num">0.725 / 0.655</td><td>up (benign)</td></tr>
+  <tr><td>sf_combo (ep1, 1.27M)</td><td>train_mae offline pool</td><td class="ok">event</td>
+      <td class="num">0.722 / 0.675</td><td class="num">0.749 / 0.698</td><td>up (benign)</td></tr>
+  <tr><td>sf_w256 (ep1, 19.5M)</td><td>train_mae offline pool</td><td class="ok">event</td>
+      <td class="num">0.769 / 0.720</td><td class="num">0.734 / 0.700</td><td>down (variance)</td></tr>
+  <tr><td>dino (ep100 t, 0.48M)</td><td>run_probes.py</td><td class="ok">image</td>
+      <td class="num">0.719 / 0.655</td><td class="num">0.768 / 0.713</td><td>up (benign)</td></tr>
+  <tr><td>polarmae (~22M)</td><td>APA2DProbeCallback</td><td class="bad">pixel</td>
+      <td class="num">0.933 / 0.940</td><td class="num">0.783 / 0.800</td><td class="bad">−0.14 (leak)</td></tr>
+  <tr><td>larmamba (~26M)</td><td>APA2DProbeCallback</td><td class="bad">pixel</td>
+      <td class="num">0.940 / 0.929</td><td class="num">0.782 / 0.805</td><td class="bad">−0.13 (leak)</td></tr>
+</table>
+
+<p class="small">
+  Unified numbers: 500 events, event-level 80/20 (seed 0), 5000 px/class per
+  side, raw floors 0.485 (sft) / 0.402 (svm) identical for every row.
+  Runs: <span class="path">/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/unified_probe_260702/</span>
+  and <span class="path">…/unified_probe_sf_260702/</span>.
+</p>
+
+<h3>What else differed across the old probes (all now unified)</h3>
+
+<table>
+  <tr><th>aspect</th><th>mae / sparseformer (old)</th><th>dino (old)</th><th>polarmae / larmamba (old)</th><th>unified</th></tr>
+  <tr><td>split granularity</td><td>event</td><td>image</td><td class="bad">pixel</td><td>event, one shared seed</td></tr>
+  <tr><td>events scored</td><td>SFT val subset</td><td>own 20% split</td><td>files 009 (val glob)</td><td>same 500 events for all</td></tr>
+  <tr><td>MLP head</td><td>3-layer + BN</td><td>3-layer + BN</td><td>2-layer GELU</td><td>2-layer ReLU, 128 hidden, for all</td></tr>
+  <tr><td>feature norm</td><td>log1p</td><td>FeatureLogTransform</td><td>APA2D log-transform + center/scale</td><td>each model's own <em>training</em> norm at extraction; shared <code>StandardScaler</code> at fitting</td></tr>
+  <tr><td>raw floor</td><td>own pool</td><td>own pool</td><td>own pool</td><td>identical by construction</td></tr>
+  <tr><td>alignment check</td><td>implicit</td><td>implicit</td><td>implicit</td><td>explicit ≥0.95 coordinate-match gate</td></tr>
+</table>
+
+<h2>5. Takeaways</h2>
+
+<ol>
+  <li><b>The ranking survives, the story changes.</b> polarmae ≈ larmamba
+      (0.78–0.80) &gt; dino (0.71–0.77) ≈ sparseformer (0.70–0.75) &gt; mae
+      (0.64–0.72). The tokenizer+transformer edge over sparse-CNNs is
+      ~0.03–0.09, not ~0.2, and is concentrated in shower ID (per-class F1
+      0.77 vs 0.51–0.65).</li>
+  <li><b>larmamba = polarmae is robust</b> — it holds under both protocols
+      (0.805 vs 0.800 svm unified).</li>
+  <li><b>Retracted:</b> "sparse-CNN caps at ~0.77, tokenizer needed for 0.9+"
+      (nothing reaches 0.9 honestly) and "width scaling lifted sparseformer
+      +0.047" (protocol variance).</li>
+  <li><b>Protocol rules going forward:</b> compare models only inside one
+      probe run (<code>ab_pid_probe</code>, one JSON); never compare numbers
+      across differently-configured probes; treat pixel-level splits of pooled
+      voxel features as invalid for spatially-smooth representations.</li>
+</ol>
+
+<p class="small">
+  Reproduce: <code>bash gridutils/submit_unified_probe.sh</code> (dump + mae +
+  polarmae/larmamba + dino, one L40S job) and
+  <code>bash gridutils/submit_unified_probe_sf.sh</code> (sparseformer rows).
+</p>
+
+</body>
+</html>
