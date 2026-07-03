@@ -19,6 +19,7 @@ POLAR_REPO="${POLAR_REPO:-/direct/lbne+u/hyu/PoLAr-MAE}"
 CACHE_DIR="${CACHE_DIR:-/gpfs01/lbne/users/fm/${USER}/cache}"
 EVENTS_NPZ="${EVENTS_NPZ:-${CONDOR_OUT}/unified_probe_260702/events.npz}"
 N_EVENTS="${N_EVENTS:-500}"
+ENCODER="${ENCODER:-polarmae}"   # mamba for larmamba runs
 
 REQUEST_MEMORY="${REQUEST_MEMORY:-64000}"
 REQUEST_CPUS="${REQUEST_CPUS:-4}"
@@ -34,7 +35,7 @@ mkdir -p "$eval_out"
 sub_dir="${eval_out}/sub"; mkdir -p "$sub_dir"
 subfile="${sub_dir}/eval_${suffix}.sub"
 
-args="${REPODIR} ${UVENV} ${POLAR_ENV} ${POLAR_REPO} ${ckpt_dir} ${EVENTS_NPZ} ${eval_out} ${CACHE_DIR} ${N_EVENTS}"
+args="${REPODIR} ${UVENV} ${POLAR_ENV} ${POLAR_REPO} ${ckpt_dir} ${EVENTS_NPZ} ${eval_out} ${CACHE_DIR} ${N_EVENTS} ${ENCODER}"
 
 cat > "$subfile" <<EOF
 universe                = vanilla

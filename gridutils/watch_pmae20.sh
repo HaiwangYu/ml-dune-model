@@ -5,10 +5,11 @@
 # while a sweep is in flight); reports per-epoch loss/val and finished eval
 # macro-F1. Prints one line per event (each becomes a Monitor notification).
 #
-# Usage: bash watch_pmae20.sh <train_run_name> <cluster_id>
+# Usage: bash watch_pmae20.sh <train_run_name> <cluster_id> [encoder=polarmae]
 set -uo pipefail
 run=${1:-pmae20_full_260703}
 cid=${2:-832}
+export ENCODER=${3:-polarmae}   # consumed by submit_eval_epochs.sh (mamba for larmamba)
 base=/gpfs01/lbne/users/fm/hyu/CONDOR_OUT/$run
 repo=/lbne/u/hyu/ml-dune-model
 ff=$base/${cid}.0.out; fe=$base/${cid}.0.err

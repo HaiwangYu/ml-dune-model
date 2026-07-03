@@ -10,12 +10,12 @@
 #
 # Args (positional):
 #   $1 repodir  $2 uvenv  $3 polar_env  $4 polar_repo  $5 ckpt_dir
-#   $6 events_npz  $7 eval_out_dir  $8 cache_dir  $9 n_events
+#   $6 events_npz  $7 eval_out_dir  $8 cache_dir  $9 n_events  $10 encoder(mamba|polarmae)
 
 set -euo pipefail
 
 repodir=$1; uvenv=$2; polar_env=$3; polar_repo=$4; ckpt_dir=$5
-events_npz=$6; eval_out=$7; cache_dir=$8; n_events=${9:-500}
+events_npz=$6; eval_out=$7; cache_dir=$8; n_events=${9:-500}; encoder=${10:-polarmae}
 
 datadir=/gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27
 apa=0; view=W
@@ -54,17 +54,17 @@ for ckpt in "${ckpts[@]}"; do
   echo "EVAL ${base}"
   feat="${scratch}/feat_${base}.npz"
 
-  # stage A: polarmae per-voxel feature export (torch 2.5 env)
+  # stage A: per-voxel feature export (torch 2.5 env)
   ( export PATH="${polar_env}/bin:${PATH}"
     export PYTHONPATH="${repodir}:${polar_repo}${PYTHONPATH:+:$PYTHONPATH}"
-    "${polar_env}/bin/python" -u -m larmamba.export_pid_features --encoder polarmae \
+    "${polar_env}/bin/python" -u -m larmamba.export_pid_features --encoder "$encoder" \
         --ckpt "$ckpt" --events "$events_npz" --num_groups 256 --context_length 512 \
         --out "$feat" ) || { echo "FAILED export ${base}"; continue; }
 
   # stage B: unified probe on the export (uvenv / WarpConvNet for truth dataset)
   ( source "${uvenv}/bin/activate"
     export PYTHONPATH="${repodir}${PYTHONPATH:+:$PYTHONPATH}"
-    ext=$(printf '{"polarmae_%s": "%s"}' "$base" "$feat")
+    ext=$(printf '{"%s_%s": "%s"}' "$encoder" "$base" "$feat")
     python -u -m dino.diagnostics.ab_pid_probe --external "$ext" \
         --datadir "$datadir" --apa "$apa" --view "$view" --cache_dir "$data_cache" \
         --n_events "$n_events" --out "$out_json" ) || { echo "FAILED probe ${base}"; continue; }
