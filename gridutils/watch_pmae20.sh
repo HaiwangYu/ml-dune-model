@@ -35,7 +35,7 @@ while true; do
     [ -z "$j" ] && continue
     tag=$(basename "$j"); marker="$base/unified_eval/.reported_${tag}"
     if [ ! -f "$marker" ]; then
-      vals=$(python3 -c "import json;e=json.load(open('$j'));print('svm_feat=%.4f sft_feat=%.4f'%(e['voxel_svm_feat'],e['sft_feat']))" 2>/dev/null)
+      vals=$(python3 -c "import json;d=json.load(open('$j'));e=next(iter(d.values()));print('svm_feat=%.4f sft_feat=%.4f'%(e['voxel_svm_feat'],e['sft_feat']))" 2>/dev/null)
       echo "[eval-result] ${tag} -> ${vals}"; touch "$marker"
     fi
   done < <(ls "$base/unified_eval/" 2>/dev/null | grep -E '^pid_probe_epoch=.*\.json$' | sed "s|^|$base/unified_eval/|")
