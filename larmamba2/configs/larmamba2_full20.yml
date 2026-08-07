@@ -17,14 +17,9 @@ trainer:
   check_val_every_n_epoch: 1
   log_every_n_steps: 50
   callbacks:
-    - class_path: pytorch_lightning.callbacks.EarlyStopping
-      init_args:
-        monitor: loss/val
-        mode: min
-        patience: 3
-        min_delta: 0.0
-        check_on_train_epoch_end: false
-        verbose: true
+    # NO EarlyStopping: run lm2v2 proved the recon loss decouples from the
+    # probe here too — it fired at ep8 on a loss/val rise while the unified
+    # probe was still climbing. Stop decisions come from the probe curve.
     - class_path: pytorch_lightning.callbacks.ModelCheckpoint
       init_args:
         dirpath: ${oc.env:CKPT_DIR}
@@ -45,7 +40,7 @@ model:
   patch_embed: conv       # primary (linear = phase-3 control)
   order_kind: morton      # reuses larmamba serialization
   drop_path_rate: 0.25
-  learning_rate: 7.0e-5   # eff-batch 64 (4 GPU x 16), sqrt-scaled
+  learning_rate: 5.0e-5   # 7e-5 destabilized at ~ep7 (train-loss step jump); tempered
   weight_decay: 0.05
   warmup_epochs: 1
   lr_min: 3.0e-6
