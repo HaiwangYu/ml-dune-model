@@ -1,0 +1,70 @@
+# larmamba2 full-1M SSL run, 20 epochs — same recipe as
+# polarmae/larmamba round 2 (4-GPU DDP, epoch cosine schedule, EarlyStopping on
+# loss/val, per-epoch checkpoint, NO in-training probe), with the grid-tile MAE.
+#
+# Launch: python -m larmamba2.train fit --config <this>   (via trainjob_larmamba2.sh,
+# which sets CKPT_DIR and NCCL_P2P_DISABLE=1).
+
+seed_everything: 0
+
+trainer:
+  gradient_clip_val: 3
+  devices: 4
+  num_nodes: 1
+  strategy: ddp_find_unused_parameters_true
+  max_epochs: 20
+  precision: bf16-mixed
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.EarlyStopping
+      init_args:
+        monitor: loss/val
+        mode: min
+        patience: 3
+        min_delta: 0.0
+        check_on_train_epoch_end: false
+        verbose: true
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: ${oc.env:CKPT_DIR}
+        every_n_epochs: 1
+        save_top_k: -1
+        save_last: true
+        save_on_train_epoch_end: false
+        filename: "{epoch:02d}-{step}"
+
+model:
+  tile_size: 5            # phase-0 study: median 324 tiles/event, 42% occupancy
+  t_max: 1024             # covers >p90 with no truncation; random subsample above
+  dim: 384
+  depth: 12
+  decoder_depth: 4
+  decoder_heads: 6
+  mask_ratio: 0.6
+  patch_embed: conv       # primary (linear = phase-3 control)
+  order_kind: morton      # reuses larmamba serialization
+  drop_path_rate: 0.25
+  learning_rate: 7.0e-5   # eff-batch 64 (4 GPU x 16), sqrt-scaled
+  weight_decay: 0.05
+  warmup_epochs: 1
+  lr_min: 3.0e-6
+
+data:
+  data_path:     /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27/13825/1/00[1-8]
+  val_data_path: /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27/13825/1/009
+  batch_size: 16
+  num_workers: 2
+  dataset_kwargs:
+    apa: 0
+    view: W
+    emin: 1.0
+    emax: 1.0e5
+    energy_threshold: 1.0
+    min_points: 256
+    max_points: 8000
+    maxlen: -1
+    return_semantic_id: false
+    return_cluster_id: false
+  test_dataset_kwargs:
+    maxlen: 2000

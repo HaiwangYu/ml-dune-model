@@ -57,9 +57,14 @@ for ckpt in "${ckpts[@]}"; do
   # stage A: per-voxel feature export (torch 2.5 env)
   ( export PATH="${polar_env}/bin:${PATH}"
     export PYTHONPATH="${repodir}:${polar_repo}${PYTHONPATH:+:$PYTHONPATH}"
-    "${polar_env}/bin/python" -u -m larmamba.export_pid_features --encoder "$encoder" \
-        --ckpt "$ckpt" --events "$events_npz" --num_groups 256 --context_length 512 \
-        --out "$feat" ) || { echo "FAILED export ${base}"; continue; }
+    if [ "$encoder" = "larmamba2" ]; then
+      "${polar_env}/bin/python" -u -m larmamba2.export_pid_features \
+          --ckpt "$ckpt" --events "$events_npz" --out "$feat"
+    else
+      "${polar_env}/bin/python" -u -m larmamba.export_pid_features --encoder "$encoder" \
+          --ckpt "$ckpt" --events "$events_npz" --num_groups 256 --context_length 512 \
+          --out "$feat"
+    fi ) || { echo "FAILED export ${base}"; continue; }
 
   # stage B: unified probe on the export (uvenv / WarpConvNet for truth dataset)
   ( source "${uvenv}/bin/activate"
