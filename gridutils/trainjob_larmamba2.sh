@@ -76,8 +76,8 @@ echo "Launching larmamba2.train fit (${run_name}) ..."
 "$PY" -u -m larmamba2.train fit \
     --config "$config" \
     --trainer.default_root_dir "$scratch_logs" \
-    --data.init_args.dataset_kwargs.cache_dir "$data_cache" \
-    --data.init_args.test_dataset_kwargs.cache_dir "$data_cache" \
+    --data.dataset_kwargs.cache_dir "$data_cache" \
+    --data.test_dataset_kwargs.cache_dir "$data_cache" \
     "${extra_args[@]}"
 
 echo "Training complete!"
