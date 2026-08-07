@@ -1,6 +1,6 @@
 # larmamba2 — native-2D grid-patch tokenizer + Mamba backbone: project plan
 
-**Date:** 2026-08-06   **Status:** plan (phase 0)   **Tracker:** (issue link added after creation)
+**Date:** 2026-08-06   **Status:** plan (phase 0)   **Tracker:** [issue #1](https://github.com/HaiwangYu/ml-dune-model/issues/1)
 **Folder:** `/larmamba2`   **Env:** `uvenv-polar-mae` (torch 2.5.1 + mamba-ssm + lightning)
 
 ## 1. Motivation
