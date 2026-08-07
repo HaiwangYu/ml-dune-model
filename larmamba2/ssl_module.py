@@ -2,10 +2,18 @@
 
 points -> tiler -> patch-embed + 2D pos -> random tile mask (MAE-style: encoder
 sees visible tokens only, compacted) -> BiMamba encoder -> transformer decoder
-with [MASK] tokens -> Linear S^2 head -> L1 on log-charge of masked tiles.
+with [MASK] tokens -> reconstruction head -> loss on masked tiles.
 
-No energy head: the S x S log-charge patch target carries geometry (which
-pixels are hit) and charge (their values) in one object (plan §3.5).
+Loss (`loss_type`):
+- "occ_l1" (default): BCE on per-pixel occupancy + L1 on log-charge at hit
+  pixels. REQUIRED for sparse targets: plain L1 is median-seeking, and with
+  per-pixel hit probability < 50% inside a masked tile its optimum is exactly
+  "predict empty everywhere" — measured on the first full run (l1_hit flat at
+  ~1.06, l1_empty ~0.008, probe stuck at random-init level).
+- "l1": plain L1 over all pixels (kept as the documented-degenerate control).
+
+No energy head either way: the patch target carries geometry (occupancy) and
+charge in one object (plan §3.5).
 """
 from __future__ import annotations
 
@@ -45,6 +53,8 @@ class Larmamba2MAE(pl.LightningModule):
         decoder_depth: int = 4,
         decoder_heads: int = 6,
         mask_ratio: float = 0.6,
+        loss_type: str = "occ_l1",       # occ_l1 | l1
+        occ_weight: float = 1.0,         # BCE weight in occ_l1
         patch_embed: str = "conv",       # conv | linear
         order_kind: str = "morton",      # morton | morton_t | raster_tick | raster_ch
         drop_path_rate: float = 0.25,
@@ -65,7 +75,8 @@ class Larmamba2MAE(pl.LightningModule):
             d_state=d_state, d_conv=d_conv, expand=expand, order_kind=order_kind,
         )
         self.decoder = PatchDecoder(dim=dim, depth=decoder_depth,
-                                    num_heads=decoder_heads, tile_size=tile_size)
+                                    num_heads=decoder_heads, tile_size=tile_size,
+                                    out_channels=2 if loss_type == "occ_l1" else 1)
 
     # ---------------- core ----------------
 
@@ -110,20 +121,36 @@ class Larmamba2MAE(pl.LightningModule):
                 max=latent_c.shape[1] - 1))
         pred = self.decoder(latent_full, self.pos(tile_coords), vis, tile_mask)
 
-        err = (pred - patches).abs()                     # (B, T, S^2) L1
-        mw = msk.unsqueeze(-1).float()
-        loss = (err * mw).sum() / (mw.sum() * err.shape[-1]).clamp(min=1)
-
-        hit = patches > HIT_THR
+        S2 = patches.shape[-1]
+        hit = patches > HIT_THR                          # (B, T, S^2)
         hit_w = (hit & msk.unsqueeze(-1)).float()
-        emp_w = (~hit & msk.unsqueeze(-1)).float()
+        bs = points.shape[0]
+
+        if self.hparams.loss_type == "occ_l1":
+            occ_logit, pred_q = pred[..., :S2], pred[..., S2:]
+            mw = msk.unsqueeze(-1).float()
+            bce = nn.functional.binary_cross_entropy_with_logits(
+                occ_logit, hit.float(), reduction="none")
+            occ_loss = (bce * mw).sum() / (mw.sum() * S2).clamp(min=1)
+            err = (pred_q - patches).abs()
+            l1_hit = (err * hit_w).sum() / hit_w.sum().clamp(min=1)
+            loss = self.hparams.occ_weight * occ_loss + l1_hit
+            self.log(f"occ_bce/{stage}", occ_loss, sync_dist=True,
+                     on_step=False, on_epoch=True, batch_size=bs)
+            self.log(f"l1_hit/{stage}", l1_hit, sync_dist=True,
+                     on_step=False, on_epoch=True, batch_size=bs)
+        else:                                            # plain L1 (degenerate control)
+            err = (pred - patches).abs()
+            mw = msk.unsqueeze(-1).float()
+            loss = (err * mw).sum() / (mw.sum() * S2).clamp(min=1)
+            emp_w = (~hit & msk.unsqueeze(-1)).float()
+            self.log(f"l1_hit/{stage}", (err * hit_w).sum() / hit_w.sum().clamp(min=1),
+                     sync_dist=True, on_step=False, on_epoch=True, batch_size=bs)
+            self.log(f"l1_empty/{stage}", (err * emp_w).sum() / emp_w.sum().clamp(min=1),
+                     sync_dist=True, on_step=False, on_epoch=True, batch_size=bs)
+
         self.log(f"loss/{stage}", loss, sync_dist=True, prog_bar=True,
-                 on_step=(stage == "train"), on_epoch=True,
-                 batch_size=points.shape[0])
-        self.log(f"l1_hit/{stage}", (err * hit_w).sum() / hit_w.sum().clamp(min=1),
-                 sync_dist=True, on_step=False, on_epoch=True, batch_size=points.shape[0])
-        self.log(f"l1_empty/{stage}", (err * emp_w).sum() / emp_w.sum().clamp(min=1),
-                 sync_dist=True, on_step=False, on_epoch=True, batch_size=points.shape[0])
+                 on_step=(stage == "train"), on_epoch=True, batch_size=bs)
         return loss
 
     def training_step(self, batch, batch_idx):

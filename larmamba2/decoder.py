@@ -30,13 +30,15 @@ class _DecoderBlock(nn.Module):
 
 class PatchDecoder(nn.Module):
     def __init__(self, dim: int = 384, depth: int = 4, num_heads: int = 6,
-                 tile_size: int = 5):
+                 tile_size: int = 5, out_channels: int = 1):
+        """out_channels=1: charge only (plain L1). out_channels=2: occupancy
+        logit + charge (occ_l1 loss) — output is (B, T, out_channels * S^2)."""
         super().__init__()
         self.mask_token = nn.Parameter(torch.zeros(dim))
         nn.init.normal_(self.mask_token, std=0.02)
         self.blocks = nn.ModuleList([_DecoderBlock(dim, num_heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, tile_size * tile_size)
+        self.head = nn.Linear(dim, out_channels * tile_size * tile_size)
 
     def forward(self, latent_full: torch.Tensor, pos: torch.Tensor,
                 vis_mask: torch.Tensor, tile_mask: torch.Tensor) -> torch.Tensor:
