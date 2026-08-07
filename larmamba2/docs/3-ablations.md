@@ -37,20 +37,40 @@
    Keep occ_weight=1 (balanced BCE/charge) and morton (2D locality beats
    drift-time raster). These are settled — drop from future sweeps.
 
-## New defaults & the combined run
+## Combined run — the effects do NOT stack
 
-Winners are complementary (mask0.75 lifts all classes; tile7 lifts shower
-specifically), so the payoff run stacks them:
+**lm2c_t7m75_260807** = tile7 + mask0.75 + linear embed: best svm **0.790**
+(ep17) / plateau **0.787**. This is **tied with either knob alone** (mask0.75
+0.792, tile7 0.791), not the ~0.80 an additive model predicted.
 
-**lm2c_t7m75_260807** = tile7 + mask0.75 + linear embed (cluster 1529, running).
-If the two +0.01 effects add, this lands ~0.80 — at the larmamba/polarmae R2
-plateau (0.815/0.819) minus ~0.015, i.e. essentially closing the gap with a
-tokenizer that is deterministic, 2D-native, dependency-light, and eval-uncapped.
+| config | best svm | plateau |
+|---|---|---|
+| baseline | 0.781 | 0.777 |
+| mask0.75 | **0.792** | 0.791 |
+| tile7 | 0.791 | 0.787 |
+| tile7 + mask0.75 | 0.790 | 0.787 |
 
-## Deferred / next
+The combined run converges *faster* (ahead at every epoch ≤5) but hits the same
+ceiling. Interpretation: the two winners are **redundant, not complementary** —
+both work by giving the reconstruction more/harder context (larger patch;
+fewer visible tiles), and they saturate at a common **~0.79 ceiling** for this
+grid-tile tokenizer. That is ~0.025 below larmamba R2 (0.815) and ~0.03 below
+polarmae R2 (0.819).
 
-- **Overlapping tiles** (stride < S): the tile7 per-class result is the
-  strongest motivation — needs a small `tiler.py` change (gather with overlap,
-  reconstruct center region only). Build if lm2c confirms tile-size sensitivity.
-- mask 0.8 / 0.85 (the ratio trend hasn't turned over).
-- All runs ~2.5 h on 4×L40S; chain driver is restart-safe and GPU-policy gated.
+## Where this leaves larmamba2
+
+**Best config: mask0.75 (tile5, linear embed, morton), plateau 0.791.** The
+native-2D tokenizer gets within ~0.025 of the FPS-tokenizer transformers while
+being deterministic (zero overflow), 2D-native (no z=0), pytorch3d-free, and
+eval-uncapped — but a per-pixel-loss grid MAE appears to top out ~0.79 on this
+task. Closing the last ~0.025 needs a *structural* change, not more knob-tuning.
+
+## Deferred / next (structural — knob sweep is exhausted)
+
+- **Overlapping tiles** (stride < S): reconstruct center region from a padded
+  context patch — removes boundary cuts, the one receptive-field lever not yet
+  tried. Strongest remaining candidate; needs a `tiler.py` change.
+- mask 0.8 (ratio trend hadn't turned over at 0.75 — one cheap check).
+- Contrastive/DINO-style objective instead of reconstruction (the sparse-CNN
+  program showed DINO > MAE at fixed backbone; may lift the ceiling here too).
+- All runs ~2.5 h on 4×L40S; chain driver restart-safe, GPU-policy gated.
